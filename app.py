@@ -45,19 +45,66 @@ GPU_OFFLOAD_LAYERS = 999
 # --- Logging Configuration ---
 LLAMAFILE_LOG_FILE = "llamafile_server.log"
 
+# --- LLM Prompts (Defined globally as they are constant) ---
+
+# Headline Summarizer Prompt: Using f-string to embed ANSI escape codes directly.
+HEADLINE_SUMMARIZER_PROMPT = f"""You are a brilliant news analyst.
+Given a list of news article titles and their brief summaries, your primary goal is to provide a diverse and distinct overview of the day's events.
+Group the articles into logical themes or categories. For each theme:
+1. Provide a very concise, unique overview of that theme.
+2. Then, list each *individual* original title and its brief summary that falls under that theme. Ensure each listed item is distinct.
+   Format each article entry as: "{ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}[Article Title]{ANSI_RESET} {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}[Article Summary]{ANSI_RESET}"
+   Make sure to include the ANSI color codes as specified.
+If an article title/summary does not clearly fit into a theme, list it under an "Other News" category.
+Prioritize distinct, informative headlines and their specific summaries. Avoid blending or over-generalizing the summaries. Focus on presenting a clear, varied picture of the news.
+
+Example Input Format:
+- Source: foxnews_article1.txt, Title: Trump Rally Draws Large Crowd, Summary: President Donald Trump held a massive rally in Arizona, addressing supporters on various political issues.
+- Source: cnn_article2.txt, Title: Global Markets React to Economic Data, Summary: Stock markets worldwide saw significant movement following the release of new economic indicators.
+- Source: rt_article3.txt, Title: Ukraine Conflict Update, Summary: Latest reports from the front lines of the Ukraine conflict, including diplomatic efforts.
+
+Example Output Format:
+**Political News**
+- Overview: Recent political gatherings and statements are influencing public discourse.
+  - {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}Trump Rally Draws Large Crowd{ANSI_RESET} {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}President Donald Trump held a massive rally in Arizona, addressing supporters on various political issues.{ANSI_RESET}
+  - {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}Senator Smith Announces Re-election Bid{ANSI_RESET} {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}Senator Smith confirmed her intention to run for re-election, focusing on economic policy.{ANSI_RESET}
+
+**Global Economy**
+- Overview: International financial markets are responding to new economic figures.
+  - {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}Global Markets React to Economic Data{ANSI_RESET} {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}Stock markets worldwide saw significant movement following the release of new economic indicators.{ANSI_RESET}
+
+**Other News**
+- {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}Ukraine Conflict Update{ANSI_RESET} {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}Latest reports from the front lines of the Ukraine conflict, including diplomatic efforts.{ANSI_RESET}
+
+Actual Input:
+{{context}}
+
+Output:"""
+
+# System Instruction Prompt for general Q&A
+SYSTEM_INSTRUCTION_PROMPT = """You are a helpful, accurate, and concise assistant.
+Prioritize answering questions based on the provided document context.
+If information for the question is found in the document, preface your answer or relevant section with: "**Based on the provided document [Source: source_filename, Title: original_title if available]:**"
+If the provided context is insufficient or the question requires broader knowledge, preface your answer or relevant section with: "**Drawing on general knowledge:**"
+If the answer cannot be found in the provided document, explicitly state: "Information for this question is not available in the provided document." before potentially offering a general answer if appropriate."""
+
+
 # --- Helper Functions ---
 
 def is_headline_query(query):
     """
     Determines if a query is likely a request for news headlines/overview.
+    More flexible matching.
     """
     query_lower = query.lower()
-    headline_keywords = ["summarize headlines", "today's headlines", "what's new", 
-                         "latest news", "news overview", "recent news", "headlines from",
-                         "news from", "summarize news", "daily briefing", "what happened",
-                         "what's the news"]
-    for keyword in headline_keywords:
-        if keyword in query_lower:
+    headline_keywords = [
+        "summarize headlines", "latest news", "news overview", "recent news",
+        "daily briefing", "what's the news", "tell me about the news", "whats happening",
+        "headlines", "news" # Single words, if present, are strong indicators
+    ]
+    # If any of these keywords are present, and it's not explicitly asking for "details" or "full article"
+    if any(keyword in query_lower for keyword in headline_keywords):
+        if not any(detail_kw in query_lower for detail_kw in ["details", "full article", "in depth", "explain", "describe"]):
             return True
     return False
 
@@ -66,7 +113,7 @@ def parse_date_and_site_from_query(query):
     Parses date and site from a query string and returns a ChromaDB filter dictionary
     and the cleaned query.
     Date formats supported: "today", "yesterday", "last week", "this month", "YYYY-MM-DD".
-    Site formats supported: "cnn.com", "foxnews.com", etc.
+    Site formats supported: "cnn.com", "foxnews.com", etc., and also common names like "fox news".
     """
     query_lower = query.lower()
     filters = {}
@@ -123,21 +170,29 @@ def parse_date_and_site_from_query(query):
                 pass # Invalid date format, continue without date filter
 
     # --- Site Parsing ---
-    # Look for common domain patterns
-    site_match = re.search(r'\b(cnn\.com|foxnews\.com|rt\.com|patriots\.win|boards\.4chan\.org/pol|google\.com/finance|themoscowtimes\.com|tass\.com|euronews\.com|aljazeera\.com|ecns\.cn)\b', query_lower)
-    if site_match:
-        site_domain = site_match.group(0).replace("www.", "") # Clean "www." for matching
-        if site_domain == "aljazeera.com": # Special handling for aljazeera.com/middle-east
-            site_domain = "aljazeera.com"
-        elif site_domain == "google.com/finance": # Special handling for google.com/finance
-            site_domain = "google.com/finance"
-        elif site_domain == "boards.4chan.org/pol": # Special handling for 4chan
-            site_domain = "boards.4chan.org"
-        elif site_domain == "themoscowtimes": # Handle common typo/omission
-            site_domain = "themoscowtimes.com"
+    # Extended regex to catch common names or full domains
+    site_patterns = {
+        r'\bfox\s*news(?:\.com)?\b': 'foxnews.com',
+        r'\bcnn(?:\.com)?\b': 'cnn.com',
+        r'\brt(?:\.com)?\b': 'rt.com',
+        r'\bpatriots\.win\b': 'patriots.win',
+        r'\b4chan(?:\.org/pol)?\b': 'boards.4chan.org', # Catches "4chan" or "4chan.org/pol"
+        r'\bgoogle(?:\.com/finance)?\b': 'google.com/finance',
+        r'\bthemoscowtimes(?:\.com)?\b': 'themoscowtimes.com',
+        r'\btass(?:\.com)?\b': 'tass.com',
+        r'\beuronews(?:\.com)?\b': 'euronews.com',
+        r'\baljazeera(?:\.com)?\b': 'aljazeera.com',
+        r'\becns(?:\.cn)?\b': 'ecns.cn'
+    }
 
-        filters["site_origin"] = site_domain
-        cleaned_query = cleaned_query.replace(site_match.group(0), "").strip()
+    site_match_found = False
+    for pattern, domain in site_patterns.items():
+        match = re.search(pattern, query_lower)
+        if match:
+            filters["site_origin"] = domain
+            cleaned_query = cleaned_query.replace(match.group(0), "").strip()
+            site_match_found = True
+            break # Found a match, no need to check other patterns
 
     # Clean up any residual "from" or "on" prepositions if they are at the start/end of the cleaned query
     cleaned_query = re.sub(r'^(from|on)\s+|\s+(from|on)$', '', cleaned_query, flags=re.IGNORECASE).strip()
@@ -145,7 +200,7 @@ def parse_date_and_site_from_query(query):
     # Remove extra spaces caused by replacements
     cleaned_query = re.sub(r'\s+', ' ', cleaned_query).strip()
 
-    return filters, cleaned_query if filters else None # Return None if no filters were applied
+    return filters, cleaned_query if filters or date_filter_applied else None # Return None if no filters were applied
 
 
 def extract_text_from_docx(docx_path):
@@ -161,9 +216,8 @@ def extract_text_from_docx(docx_path):
 
 def load_documents_from_directory(directory: Path, load_summaries=False, summary_kb_name=None):
     """
-    Loads all .txt files and associated .json metadata from a given directory into a list of Langchain Document objects.
-    If load_summaries is True, it uses the 'article_summary' from JSON as page_content.
-    If summary_kb_name is provided, it explicitly sets the category for summary documents.
+    Loads documents from a given directory into a list of Langchain Document objects.
+    Handles different directory structures based on whether it's the NEWS_DIR or others.
     """
     documents = []
     print(f"  Scanning: {directory} {'(for summaries)' if load_summaries else ''}")
@@ -171,19 +225,43 @@ def load_documents_from_directory(directory: Path, load_summaries=False, summary
         print(f"  Warning: Directory '{directory}' does not exist. Skipping.")
         return []
 
-    for site_timestamp_folder in directory.iterdir():
-        if site_timestamp_folder.is_dir():
-            for root, _, files in os.walk(site_timestamp_folder):
-                for file_name in files:
-                    file_path = os.path.join(root, file_name)
-                    if file_name.endswith(".txt"):
-                        metadata_file_path = Path(file_path).with_suffix('.json')
+    # Determine the starting point for os.walk based on the directory type
+    # For NEWS_DIR, we expect a nested structure (site_timestamp_folder) but can fall back
+    # For MISC, SEC, LEGAL, we expect files directly or in simple subfolders
+    dirs_to_walk = []
+    if directory == NEWS_DIR:
+        # Check for timestamped subdirectories first
+        potential_subdirs = [d for d in directory.iterdir() if d.is_dir()]
+        if potential_subdirs:
+            dirs_to_walk.extend(potential_subdirs)
+        else:
+            # If no subdirs, treat NEWS_DIR itself as the starting point for walk
+            print(f"  Info: No timestamped subdirectories found in {directory}. Scanning {directory} directly for news.")
+            dirs_to_walk = [directory]
+    else:
+        # For MISC, SEC, LEGAL, always start walk from the main directory
+        dirs_to_walk = [directory]
+
+    # If no directories to walk (e.g., NEWS_DIR is empty and has no subdirs), return early
+    if not dirs_to_walk:
+        print(f"  Info: No valid content directories found within {directory}.")
+        return []
+
+    for start_dir in dirs_to_walk:
+        for root, _, files in os.walk(start_dir):
+            for file_name in files:
+                file_path = os.path.join(root, file_name)
+                # Ensure we are not trying to load non-txt files as text with a json metadata expectation
+                
+                # Logic for .txt files
+                if file_name.endswith(".txt"):
+                    metadata_file_path = Path(file_path).with_suffix('.json')
+                    # If it's a news directory or explicitly loading summaries, we expect JSON metadata
+                    if load_summaries or directory == NEWS_DIR: 
                         if metadata_file_path.exists():
                             try:
                                 with open(metadata_file_path, 'r', encoding='utf-8') as f:
                                     metadata = json.load(f)
-                                    
-                                    # Ensure publication_date is ISO format for Chroma
                                     if "publication_date" in metadata and isinstance(metadata["publication_date"], str):
                                         try:
                                             parsed_dt = datetime.strptime(metadata["publication_date"], "%Y-%m-%d_%H-%M-%S")
@@ -191,36 +269,30 @@ def load_documents_from_directory(directory: Path, load_summaries=False, summary
                                         except ValueError:
                                             print(f"    Warning: Could not parse date format in metadata for {file_name}. Storing as original string.")
                                     
-                                    # Choose content based on load_summaries flag
                                     content_to_load = ""
                                     if load_summaries and "article_summary" in metadata:
                                         content_to_load = metadata["article_summary"]
-                                    elif not load_summaries: # Default to full text
+                                    elif not load_summaries: # Default to full text if not loading summaries
                                         loader = TextLoader(file_path, encoding='utf-8')
                                         docs_from_loader = loader.load()
                                         if docs_from_loader:
                                             content_to_load = docs_from_loader[0].page_content
                                     
                                     if content_to_load:
-                                        # Merge loaded metadata with default Langchain metadata
-                                        # IMPORTANT: Ensure 'source' and 'file_path' are correctly set for citation
                                         doc_metadata = {
                                             "source": file_name, 
                                             "file_path": file_path,
                                             "category": summary_kb_name if load_summaries and summary_kb_name else directory.name
                                         }
-                                        doc_metadata.update(metadata) # Overlay other metadata from JSON
-                                        
+                                        doc_metadata.update(metadata)
                                         documents.append(LcDocument(page_content=content_to_load, metadata=doc_metadata))
                                     else:
-                                        print(f"    Skipping {file_name}: No content (or summary) to load.")
-
+                                        print(f"    Skipping {file_name}: No content (or summary) to load from JSON/text.")
                             except json.JSONDecodeError as e:
                                 print(f"    Error reading JSON metadata for {file_name}: {e}. Skipping metadata and text loading.")
                             except Exception as e:
                                 print(f"    Error processing {file_name}: {e}.")
-                        else:
-                            # For non-news categories, or if JSON is missing, load text directly
+                        else: # If JSON metadata is expected (news or summaries) but not found, just load the text file
                             try:
                                 loader = TextLoader(file_path, encoding='utf-8')
                                 docs_from_loader = loader.load()
@@ -231,16 +303,29 @@ def load_documents_from_directory(directory: Path, load_summaries=False, summary
                                     documents.append(doc)
                             except Exception as e:
                                 print(f"    Error loading text file {file_name}: {e}")
-                    # Handle other file types (DOCX, PDF, HTML) for non-news directories
-                    elif not load_summaries: # Only load full content for non-news or if not loading summaries
+                    else: # For non-news TXT files where JSON metadata is NOT expected
                         try:
-                            if file_name.endswith(".docx"):
-                                print(f"    Loading DOCX file: {file_name}")
-                                text_content = extract_text_from_docx(file_path)
-                                if text_content:
-                                    documents.append(LcDocument(page_content=text_content, metadata={"source": file_name, "file_path": file_path, "category": directory.name}))
-                            elif file_name.endswith(".pdf"):
-                                print(f"    Loading PDF file: {file_name}")
+                            loader = TextLoader(file_path, encoding='utf-8')
+                            docs_from_loader = loader.load()
+                            for doc in docs_from_loader:
+                                doc.metadata["category"] = directory.name
+                                doc.metadata["source"] = file_name 
+                                doc.metadata["file_path"] = file_path
+                                documents.append(doc)
+                        except Exception as e:
+                            print(f"    Error loading text file {file_name}: {e}")
+                
+                # Logic for non-TXT files (DOCX, PDF, HTML) - only loaded if not in summary mode
+                elif not load_summaries: 
+                    try:
+                        if file_name.endswith(".docx"):
+                            print(f"    Loading DOCX file: {file_name}")
+                            text_content = extract_text_from_docx(file_path)
+                            if text_content:
+                                documents.append(LcDocument(page_content=text_content, metadata={"source": file_name, "file_path": file_path, "category": directory.name}))
+                        elif file_name.endswith(".pdf"):
+                            print(f"    Loading PDF file: {file_name}")
+                            try:
                                 loader = PyPDFLoader(file_path)
                                 docs = loader.load()
                                 for doc in docs:
@@ -248,9 +333,14 @@ def load_documents_from_directory(directory: Path, load_summaries=False, summary
                                     doc.metadata["source"] = file_name 
                                     doc.metadata["file_path"] = file_path
                                     documents.append(doc)
-                            elif file_name.endswith(".html") or file_name.endswith(".htm"):
-                                print(f"    Loading HTML file: {file_name}")
-                                if directory == SEC_DIR:
+                            except ImportError:
+                                print(f"    Skipping PDF file {file_name}: 'pypdf' not installed. Please install with `pip install pypdf`.")
+                            except Exception as pdf_e:
+                                print(f"    Error loading PDF file {file_name}: {pdf_e}. Ensure 'pypdf' is installed and the PDF is not corrupted.")
+                        elif file_name.endswith(".html") or file_name.endswith(".htm"):
+                            print(f"    Loading HTML file: {file_name}")
+                            if directory == SEC_DIR:
+                                try:
                                     print(f"      Using BeautifulSoup for enhanced SEC HTML parsing for {file_name}")
                                     with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                                         html_content = f.read()
@@ -264,7 +354,12 @@ def load_documents_from_directory(directory: Path, load_summaries=False, summary
                                         documents.append(LcDocument(page_content=text, metadata={"source": file_name, "file_path": file_path, "category": directory.name}))
                                     else:
                                         print(f"      No meaningful text extracted from {file_name} using BeautifulSoup. File might be malformed or empty.")
-                                else:
+                                except ImportError:
+                                    print(f"    Skipping HTML file {file_name} (SEC): 'beautifulsoup4' not installed. Please install with `pip install beautifulsoup4`.")
+                                except Exception as bs_e:
+                                    print(f"    Error parsing HTML file {file_name} (SEC) with BeautifulSoup: {bs_e}.")
+                            else:
+                                try:
                                     loader = UnstructuredHTMLLoader(file_path)
                                     docs = loader.load()
                                     for doc in docs:
@@ -272,10 +367,14 @@ def load_documents_from_directory(directory: Path, load_summaries=False, summary
                                         doc.metadata["source"] = file_name 
                                         doc.metadata["file_path"] = file_path
                                         documents.extend(docs) 
-                        except Exception as e:
-                            print(f"    Error loading {file_name} as {file_name.split('.')[-1].upper()} file: {e}")
-                    else:
-                        print(f"    Skipping unsupported file type or not loading full content: {file_name}")
+                                except ImportError:
+                                    print(f"    Skipping HTML file {file_name}: 'unstructured' or its dependencies not installed. Please install with `pip install unstructured`.")
+                                except Exception as unstr_e:
+                                    print(f"    Error loading HTML file {file_name} with UnstructuredHTMLLoader: {unstr_e}.")
+                    except Exception as e: # Catch all other potential errors during file loading
+                        print(f"    An unexpected error occurred loading {file_name} as {file_name.split('.')[-1].upper()} file: {e}")
+                else:
+                    print(f"    Skipping unsupported file type or not loading full content for summary mode: {file_name}")
 
     print(f"  Loaded {len(documents)} documents from {directory}.")
     return documents
@@ -415,170 +514,177 @@ def initialize_llm_for_summarization():
         print(f"Error initializing LLM for scraper summarization: {e}")
         return None
 
-def is_valid_url(url, base_url_parsed):
+# --- New Helper for Parsing User Input ---
+def parse_user_input(user_input, available_kbs_keys):
     """
-    Checks if a URL is valid and is from the same domain as BASE_URL.
+    Parses user input to determine selected category, query text, and metadata filters.
+    Returns (selected_category, original_query_text, query_text_for_llm, metadata_filter).
     """
-    parsed_url = urlparse(url)
-    return parsed_url.scheme in ['http', 'https'] and base_url_parsed.netloc == parsed_url.netloc
-
-def initialize_driver():
-    """Initializes and returns a headless Chrome WebDriver."""
-    # This function is not used in app.py, but is present in the scraper code.
-    # Its definition is kept here for reference or if parts are re-integrated.
-    # If this function were to be used, 'Options', 'Service', 'webdriver', 'By', 'WebDriverWait', 'EC', 'TimeoutException', 'WebDriverException'
-    # would need to be imported from selenium.
-
-    # This part of the code is from the scraper and should NOT be in app.py's executable path.
-    # It's here due to the user's selection, but will not be executed.
-    # If the user intends to merge scraper functionality into app.py, these imports would be needed.
-    try: # Added try-except to handle NameError if imports are missing from app.py
-        from selenium import webdriver
-        from selenium.webdriver.chrome.service import Service
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
-        from selenium.common.exceptions import TimeoutException, WebDriverException
-        from selenium.webdriver.chrome.options import Options 
-        options = Options() 
-        options.add_argument("--headless")  
-        options.add_argument("--no-sandbox") 
-        options.add_argument("--disable-dev-shm-usage") 
-        options.add_argument("--disable-gpu") 
-        options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36") 
-        
-        service = Service(CHROMEDRIVER_PATH)
-        driver = webdriver.Chrome(service=service, options=options)
-        driver.set_page_load_timeout(SELENIUM_PAGE_LOAD_TIMEOUT)
-        return driver
-    except ImportError:
-        print("Selenium-related imports missing. `initialize_driver` will not function.")
-        return None
-    except Exception as e:
-        print(f"Error initializing WebDriver: {e}")
-        return None
-
-
-def get_page_content_selenium(driver, url):
-    """
-    Fetches the content of a given URL using Selenium to handle dynamic content.
-    This function is also from the scraper and not directly used by app.py.
-    """
-    try:
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
-        from selenium.common.exceptions import TimeoutException, WebDriverException
-        driver.get(url)
-        WebDriverWait(driver, SELENIUM_PAGE_LOAD_TIMEOUT).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
-        
-        for _ in range(SCROLL_COUNT):
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(SCROLL_PAUSE_TIME)
-        
-        return driver.page_source
-    except TimeoutException:
-        print(f"  Timeout loading page: {url}. Content might be incomplete.")
-        return driver.page_source 
-    except WebDriverException as e:
-        print(f"  Error fetching {url} with Selenium: {e}")
-        return None
-
-def extract_text_from_html(html_content):
-    """
-    Extracts main readable text from HTML content using BeautifulSoup.
-    Prioritizes common article/main content elements for cleaner text.
-    If specific containers are not found, it falls back to a broader cleanup.
-    Also extracts the <title> tag text.
-    This function is also primarily from the scraper and not directly used by app.py.
-    """
-    soup = BeautifulSoup(html_content, 'html.parser')
-
-    # Extract title first
-    page_title = soup.find('title')
-    title_text = page_title.get_text(strip=True) if page_title else ""
-
-    # Aggressively remove common irrelevant UI elements
-    for element in soup([
-        "script", "style", "nav", "footer", "header", "aside", "form",
-        "iframe", "img", "button", "input", "select", "textarea", 
-        "noscript", "meta", "link", 
-        "svg", "canvas", "audio", "video", "source", "track", 
-        ".sidebar", ".ad", ".advertisement", ".promo", ".widget", 
-        "[id*='ad']", "[class*='ad']", "[id*='promo']", "[class*='promo']", 
-        "[role='banner']", "[role='contentinfo']", "[role='navigation']", 
-        ".comments", "[id*='comment']", "[class*='comment']", 
-        ".feed-item-vote", ".vote-buttons", 
-        ".user-info", ".user-flair", 
-        ".icon", ".thumb", ".spoiler", 
-        ".bottom-bar", ".top-bar",
-        ".header-container", ".footer-container", ".navbar", ".masthead",
-        ".social-share", ".read-more", ".related-articles", ".pagination",
-        ".search-form", ".breadcrumb", ".sub-menu", ".menu-item", ".menu",
-        ".byline", 
-        ".comment-form", ".tags", ".categories", ".article-meta",
-        "figcaption", 
-        "figure" 
-    ]):
-        element.extract()
-
-    # Try to find common article/main content containers
-    content_elements = soup.find_all([
-        'article', 'main', 
-        lambda tag: tag.name == 'div' and (
-            'article' in tag.get('class', []) or 'post' in tag.get('class', []) or 
-            'story' in tag.get('class', []) or 'main-content' in tag.get('id', '') or 
-            'content' in tag.get('id', '') or 'entry-content' in tag.get('class', []) or
-            'article-body' in tag.get('class', []) or 'post-body' in tag.get('class', []) or
-            'news-article' in tag.get('class', []) or 'news-content' in tag.get('class', []) or
-            'entry-content' in tag.get('id', '') or 'article__content' in tag.get('class', []) or
-            'article-text' in tag.get('class', []) or 'itemBody' in tag.get('class', []) or
-            'post-content' in tag.get('class', [])
-        ),
-        lambda tag: tag.name == 'section' and (
-            'article' in tag.get('class', []) or 'main-content' in tag.get('id', '')
-        ),
-    ])
-
-    text_parts = []
-    if content_elements:
-        for tag in content_elements:
-            text_parts.append(tag.get_text(separator=' ', strip=True)) 
-    else:
-        text_parts.append(soup.get_text(separator=' ', strip=True)) 
+    selected_category = 'auto' 
+    original_query_text = user_input
+    query_text_for_llm = user_input 
+    metadata_filter = None 
     
-    raw_text = " ".join(text_parts)
-    cleaned_text = re.sub(r'\s+', ' ', raw_text).strip()
+    # Check for explicit category prefix
+    if ':' in user_input:
+        parts = user_input.split(':', 1)
+        category_prefix = parts[0].strip().lower()
+        if category_prefix in available_kbs_keys:
+            selected_category = category_prefix
+            original_query_text = parts[1].strip() 
+            query_text_for_llm = original_query_text 
+        else:
+            print(f"{ANSI_BLUE}Invalid category '{category_prefix}'. Attempting intelligent routing.{ANSI_RESET}")
+            # selected_category remains 'auto' for intelligent routing/fallback
 
-    return cleaned_text, title_text # Return both cleaned text and title
+    # Determine if it's a headline request for auto-routing
+    is_headline_req_auto_detected = False
+    if selected_category == 'auto' and is_headline_query(original_query_text):
+        is_headline_req_auto_detected = True
+        selected_category = 'news_summaries' # Force to news_summaries if auto-detected as headline
 
-# This scrape_single_site function is from the scraper (scrape.py)
-# It should generally not be present in app.py. Its presence here is due to the user's selected context.
-# If the user intends for scraping to happen within app.py, then all selenium imports are crucial.
-# For now, it's defined but not called within app.py's main execution flow.
-def scrape_single_site(base_url_input, llm_summarizer):
+    # Parse date and site filters if it's a headline request (explicit or auto-detected)
+    if selected_category == 'news_summaries':
+        parsed_filter, cleaned_query_after_filter = parse_date_and_site_from_query(original_query_text)
+        if parsed_filter:
+            metadata_filter = parsed_filter
+            query_text_for_llm = cleaned_query_after_filter 
+        # If no specific filter was found, query_text_for_llm remains original_query_text
+
+    return selected_category, original_query_text, query_text_for_llm, metadata_filter
+
+# --- New Handler Functions ---
+
+def handle_news_summary_query(llm, news_summaries_vectorstore, original_query_text, query_text_for_llm, metadata_filter, HEADLINE_SUMMARIZER_PROMPT, SYSTEM_INSTRUCTION_PROMPT):
     """
-    Scrapes a single site: initializes its own driver, scrapes links, and saves content.
-    Generates a summary for each article using the provided LLM.
-    Designed to be run in a separate thread.
+    Handles queries specifically for news headlines/summaries.
     """
-    BASE_URL = base_url_input 
-    driver = None
-    articles_saved_for_site = 0 
-    try:
-        # Assuming initialize_driver, get_page_content_selenium, extract_text_from_html are accessible
-        # or would be imported/defined if this function were actively used in app.py
-        # For current app.py, this function is not called.
-        print(f"  (Note: `scrape_single_site` function is defined but not called by `app.py`'s main logic.)")
-        # Placeholder for actual scraping logic if this function were to be invoked.
-        # This function's presence is due to the selected code block, not its usage in app.py's current main loop.
-    except Exception as e:
-        print(f"  An error occurred within scrape_single_site (not directly called by app.py main): {e}")
-    finally:
-        if driver:
-            driver.quit() 
+    NEWS_SUMMARIES_KB_NAME = "news_summaries" # Ensure this is consistent
+    print(f"Searching and generating high-level news overview from '{NEWS_SUMMARIES_KB_NAME.upper()}' knowledge base (streaming)...")
+    
+    if news_summaries_vectorstore:
+        if metadata_filter:
+            print(f"  Applying metadata filter: {metadata_filter}")
+            retriever = news_summaries_vectorstore.as_retriever(filter=metadata_filter, search_kwargs={"k": 50}) # Can adjust k here
+        else:
+            retriever = news_summaries_vectorstore.as_retriever(search_kwargs={"k": 50}) # Can adjust k here
+        
+        retrieved_docs_raw = retriever.get_relevant_documents(query_text_for_llm)
+        
+        # Deduplicate retrieved summaries based on file_path (most reliable)
+        unique_docs_map = {}
+        for doc in retrieved_docs_raw:
+            doc_key = doc.metadata.get("file_path") 
+            if doc_key and doc_key not in unique_docs_map: 
+                unique_docs_map[doc_key] = doc
+        retrieved_docs = list(unique_docs_map.values())
+        print(f"  Retrieved {len(retrieved_docs_raw)} raw summaries, kept {len(retrieved_docs)} unique summaries.")
+
+        if not retrieved_docs:
+            print(f"{ANSI_BLUE}No relevant news summaries found in the '{NEWS_SUMMARIES_KB_NAME}' knowledge base for your query.{ANSI_RESET}") 
+            user_query_content = f"Question: {original_query_text}\nAnswer:"
+            messages_for_llm = [
+                {"role": "system", "content": SYSTEM_INSTRUCTION_PROMPT},
+                {"role": "user", "content": user_query_content}
+            ]
+        else:
+            headline_context_parts = []
+            for doc in retrieved_docs:
+                title = doc.metadata.get("original_title", "No Title")
+                summary = doc.page_content 
+                source_info = doc.metadata.get("source", "Unknown Source")
+                site_origin = doc.metadata.get("site_origin", "Unknown Site")
+                headline_context_parts.append(f"- Source: {source_info}, Site: {site_origin}, {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}{title}{ANSI_RESET}, {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}{summary}{ANSI_RESET}")
+            
+            context_str = "\n".join(headline_context_parts)
+            user_query_content = HEADLINE_SUMMARIZER_PROMPT.format(context=context_str)
+            messages_for_llm = [
+                {"role": "system", "content": SYSTEM_INSTRUCTION_PROMPT},
+                {"role": "user", "content": user_query_content}
+            ]
+    else:
+        print(f"{ANSI_BLUE}News summaries knowledge base not loaded. Cannot provide headline overview.{ANSI_RESET}") 
+        return # Exit the handler if KB is not available
+
+    # Print streaming response
+    print("\n--- Answer (Streaming) ---")
+    print(ANSI_BLUE, end="", flush=True) 
+    full_response_content = ""
+    for chunk in llm.stream(messages_for_llm):
+        if chunk.content:
+            print(chunk.content, end="", flush=True)
+            full_response_content += chunk.content
+    print(ANSI_RESET) 
+    print("\n")
+
+def handle_general_query(llm, knowledge_bases_dict, original_query_text, query_text_for_llm, target_kb_names, SYSTEM_INSTRUCTION_PROMPT):
+    """
+    Handles general document queries, which might target a specific KB or all content KBs.
+    `target_kb_names` can be a single KB name string or a list of KB names.
+    """
+    retrieved_docs = []
+    
+    if isinstance(target_kb_names, str): # Single KB specified
+        kb_name = target_kb_names
+        current_vectorstore = knowledge_bases_dict.get(kb_name)
+        if current_vectorstore:
+            print(f"Searching and generating response from '{kb_name.upper()}' knowledge base (streaming)...")
+            retriever = current_vectorstore.as_retriever()
+            retrieved_docs.extend(retriever.get_relevant_documents(query_text_for_llm))
+        else:
+            print(f"{ANSI_BLUE}Knowledge base '{kb_name}' not loaded. Skipping search.{ANSI_RESET}")
+    elif isinstance(target_kb_names, list): # Multiple KBs (e.g., for 'all' or 'auto' fallback)
+        print(f"Searching across {ANSI_BLUE}multiple knowledge bases:{', '.join(kb.upper() for kb in target_kb_names)}{ANSI_RESET} (streaming)...")
+        for kb_name in target_kb_names:
+            current_vectorstore = knowledge_bases_dict.get(kb_name)
+            if current_vectorstore:
+                print(f"  Querying {kb_name.upper()} knowledge base...")
+                retriever = current_vectorstore.as_retriever()
+                retrieved_docs.extend(retriever.get_relevant_documents(query_text_for_llm))
+            else:
+                print(f"  {ANSI_BLUE}Knowledge base '{kb_name}' not loaded. Skipping.{ANSI_RESET}")
+
+    if not retrieved_docs:
+        print(f"{ANSI_BLUE}No relevant documents found in the selected knowledge base(s) for your query.{ANSI_RESET}") 
+        context_str = "" # Explicitly empty context for LLM to use general knowledge
+        user_query_content = f"Question: {original_query_text}\nAnswer:"
+        messages_for_llm = [
+            {"role": "system", "content": SYSTEM_INSTRUCTION_PROMPT},
+            {"role": "user", "content": user_query_content}
+        ]
+    else:
+        context_parts = []
+        for doc in retrieved_docs:
+            source_info = doc.metadata.get("source", "Unknown Source")
+            original_title = doc.metadata.get("original_title")
+            title_part = f", Title: {original_title}" if original_title else ""
+            context_parts.append(f"Source: {source_info}{title_part}\nContent: {doc.page_content}")
+        context_str = "\n\n".join(context_parts)
+        
+        user_query_content = f"""Context:
+{context_str}
+
+Question: {original_query_text} 
+
+Please summarize the information in the provided context, identifying and creating distinct, relevant sections based on the content. Provide key points under each section in bullet points. If information for a category is not found, you can omit that category or state that the information is not available in the document.
+
+Answer:"""
+        messages_for_llm = [
+            {"role": "system", "content": SYSTEM_INSTRUCTION_PROMPT},
+            {"role": "user", "content": user_query_content}
+        ]
+
+    # Print streaming response
+    print("\n--- Answer (Streaming) ---")
+    print(ANSI_BLUE, end="", flush=True) 
+    full_response_content = ""
+    for chunk in llm.stream(messages_for_llm):
+        if chunk.content:
+            print(chunk.content, end="", flush=True)
+            full_response_content += chunk.content
+    print(ANSI_RESET) 
+    print("\n")
+
 
 def main():
     """
@@ -601,7 +707,7 @@ def main():
     # Base directory for all vector stores (each will get its own subdirectory)
     BASE_VECTOR_DB_DIR.mkdir(exist_ok=True)
 
-    # NEW: Define path for the news summaries vector store
+    # Define news summaries KB name
     NEWS_SUMMARIES_KB_NAME = "news_summaries" 
 
     print("\n--- Document Organization ---")
@@ -642,7 +748,7 @@ def main():
     if news_full_vectorstore:
         knowledge_bases['news_full'] = news_full_vectorstore # Renamed key for clarity
 
-    # NEW: Load documents and initialize vector store for News Summaries category
+    # Load documents and initialize vector store for News Summaries category
     print(f"\nLoading documents and initializing vector store for '{NEWS_SUMMARIES_KB_NAME}' (summaries)...")
     news_summary_docs = load_documents_from_directory(NEWS_DIR, load_summaries=True, summary_kb_name=NEWS_SUMMARIES_KB_NAME) # Pass KB name for category
     news_summary_vectorstore = initialize_vector_store_for_category(news_summary_docs, NEWS_SUMMARIES_KB_NAME, use_summaries=True)
@@ -676,49 +782,6 @@ def main():
             llamafile_process.terminate()
         return
 
-    # NEW: Separate prompt for headline summarization - ENHANCED FOR DIVERSITY AND COLORS
-    # Using f-string to embed ANSI escape codes directly into the prompt string at definition time.
-    # The `{{context}}` is escaped so it's a literal {context} for the LLM to fill later.
-    HEADLINE_SUMMARIZER_PROMPT = f"""You are a brilliant news analyst.
-Given a list of news article titles and their brief summaries, your primary goal is to provide a diverse and distinct overview of the day's events.
-Group the articles into logical themes or categories. For each theme:
-1. Provide a very concise, unique overview of that theme.
-2. Then, list each *individual* original title and its brief summary that falls under that theme. Ensure each listed item is distinct.
-   Format each article entry as: "{ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}[Article Title]{ANSI_RESET} {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}[Article Summary]{ANSI_RESET}"
-   Make sure to include the ANSI color codes as specified.
-If an article title/summary does not clearly fit into a theme, list it under an "Other News" category.
-Prioritize distinct, informative headlines and their specific summaries. Avoid blending or over-generalizing the summaries. Focus on presenting a clear, varied picture of the news.
-
-Example Input Format:
-- Source: foxnews_article1.txt, Title: Trump Rally Draws Large Crowd, Summary: President Donald Trump held a massive rally in Arizona, addressing supporters on various political issues.
-- Source: cnn_article2.txt, Title: Global Markets React to Economic Data, Summary: Stock markets worldwide saw significant movement following the release of new economic indicators.
-- Source: rt_article3.txt, Title: Ukraine Conflict Update, Summary: Latest reports from the front lines of the Ukraine conflict, including diplomatic efforts.
-
-Example Output Format:
-**Political News**
-- Overview: Recent political gatherings and statements are influencing public discourse.
-  - {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}Trump Rally Draws Large Crowd{ANSI_RESET} {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}President Donald Trump held a massive rally in Arizona, addressing supporters on various political issues.{ANSI_RESET}
-  - {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}Senator Smith Announces Re-election Bid{ANSI_RESET} {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}Senator Smith confirmed her intention to run for re-election, focusing on economic policy.{ANSI_RESET}
-
-**Global Economy**
-- Overview: International financial markets are responding to new economic figures.
-  - {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}Global Markets React to Economic Data{ANSI_RESET} {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}Stock markets worldwide saw significant movement following the release of new economic indicators.{ANSI_RESET}
-
-**Other News**
-- {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}Ukraine Conflict Update{ANSI_RESET} {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}Latest reports from the front lines of the Ukraine conflict, including diplomatic efforts.{ANSI_RESET}
-
-Actual Input:
-{{context}}
-
-Output:"""
-
-
-    SYSTEM_INSTRUCTION_PROMPT = """You are a helpful, accurate, and concise assistant.
-Prioritize answering questions based on the provided document context.
-If information for the question is found in the document, preface your answer or relevant section with: "**Based on the provided document [Source: source_filename, Title: original_title if available]:**"
-If the provided context is insufficient or the question requires broader knowledge, preface your answer or relevant section with: "**Drawing on general knowledge:**"
-If the answer cannot be found in the provided document, explicitly state: "Information for this question is not available in the provided document." before potentially offering a general answer if appropriate."""
-
     print("\nReady to answer questions about your documents!")
     print("Available knowledge bases:")
     for key in knowledge_bases.keys():
@@ -739,7 +802,7 @@ If the answer cannot be found in the provided document, explicitly state: "Infor
                 print("Please enter a question.")
                 continue
             
-            # --- New: Handle 'help' command ---
+            # --- Handle 'help' command ---
             if user_input.lower() == "help":
                 print("\n--- Help: Available Knowledge Bases & Sample Prompts ---")
                 print(f"Available Knowledge Bases (Categories): {', '.join(kb.upper() for kb in knowledge_bases.keys())}")
@@ -763,211 +826,36 @@ If the answer cannot be found in the provided document, explicitly state: "Infor
                 print("-----------------------------------------------------")
                 continue # Skip the rest of the loop and prompt again
 
-            selected_category = 'auto' 
-            original_query_text = user_input
-            query_text_for_llm = user_input 
-            metadata_filter = None 
-            
-            if ':' in user_input:
-                parts = user_input.split(':', 1)
-                category_prefix = parts[0].strip().lower()
-                if category_prefix in knowledge_bases:
-                    selected_category = category_prefix
-                    original_query_text = parts[1].strip() 
-                    query_text_for_llm = original_query_text 
-                else:
-                    print(f"{ANSI_BLUE}Invalid category '{category_prefix}'. Attempting intelligent routing.{ANSI_RESET}") 
-                    selected_category = 'auto' 
+            # --- Routing Logic ---
+            selected_category, original_query_text, query_text_for_llm, metadata_filter = \
+                parse_user_input(user_input, knowledge_bases.keys())
 
-            is_headline_request = False
-            if selected_category == 'news_summaries' or \
-               (selected_category == 'auto' and is_headline_query(original_query_text)):
-                is_headline_request = True
-                selected_category = 'news_summaries' 
-
-            retrieved_docs = [] 
-            context_str = "" # Initialize context_str at the top of the loop
-
-            if is_headline_request:
-                parsed_filter, cleaned_query = parse_date_and_site_from_query(original_query_text)
-                if parsed_filter:
-                    metadata_filter = parsed_filter
-                    query_text_for_llm = cleaned_query 
-                else:
-                    query_text_for_llm = original_query_text 
-                
-                current_vectorstore = knowledge_bases.get(NEWS_SUMMARIES_KB_NAME)
-                if current_vectorstore:
-                    print(f"Searching and generating high-level news overview from '{NEWS_SUMMARIES_KB_NAME.upper()}' knowledge base (streaming)...")
-                    if metadata_filter:
-                        print(f"  Applying metadata filter: {metadata_filter}")
-                        retriever = current_vectorstore.as_retriever(filter=metadata_filter, search_kwargs={"k": 50}) 
-                    else:
-                        retriever = current_vectorstore.as_retriever(search_kwargs={"k": 50}) 
-                    
-                    retrieved_docs_raw = retriever.get_relevant_documents(query_text_for_llm)
-                    
-                    # Deduplicate retrieved summaries based on file_path (most reliable)
-                    unique_docs_map = {}
-                    for doc in retrieved_docs_raw:
-                        doc_key = doc.metadata.get("file_path") 
-                        if doc_key and doc_key not in unique_docs_map: 
-                            unique_docs_map[doc_key] = doc
-                    retrieved_docs = list(unique_docs_map.values())
-                    print(f"  Retrieved {len(retrieved_docs_raw)} raw summaries, kept {len(retrieved_docs)} unique summaries.")
-
-
-                    if not retrieved_docs:
-                        print(f"{ANSI_BLUE}No relevant news summaries found in the '{NEWS_SUMMARIES_KB_NAME}' knowledge base for your query.{ANSI_RESET}") 
-                        user_query_content = f"Question: {original_query_text}\nAnswer:"
-                        messages_for_llm = [
-                            {"role": "system", "content": SYSTEM_INSTRUCTION_PROMPT},
-                            {"role": "user", "content": user_query_content}
-                        ]
-                    else:
-                        headline_context_parts = []
-                        for doc in retrieved_docs:
-                            title = doc.metadata.get("original_title", "No Title")
-                            summary = doc.page_content 
-                            source_info = doc.metadata.get("source", "Unknown Source")
-                            site_origin = doc.metadata.get("site_origin", "Unknown Site")
-                            # Formatted with ANSI colors directly in the string that will be passed to the LLM.
-                            # The LLM is instructed to reproduce these codes in its output.
-                            headline_context_parts.append(f"- Source: {source_info}, Site: {site_origin}, {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}{title}{ANSI_RESET}, {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}{summary}{ANSI_RESET}")
-                        
-                        context_str = "\n".join(headline_context_parts) # Define context_str here
-                        user_query_content = HEADLINE_SUMMARIZER_PROMPT.format(context=context_str)
-                        messages_for_llm = [
-                            {"role": "system", "content": SYSTEM_INSTRUCTION_PROMPT},
-                            {"role": "user", "content": user_query_content}
-                        ]
-
-                else:
-                    print(f"{ANSI_BLUE}News summaries knowledge base not loaded. Cannot provide headline overview.{ANSI_RESET}") 
-                    continue 
-                
-            elif selected_category == 'news_full': 
-                parsed_filter, cleaned_query = parse_date_and_site_from_query(original_query_text)
-                if parsed_filter:
-                    metadata_filter = parsed_filter
-                    query_text_for_llm = cleaned_query 
-                else:
-                    query_text_for_llm = original_query_text
-                
-                current_vectorstore = knowledge_bases.get('news_full')
-                if current_vectorstore:
-                    print(f"Searching and generating detailed news response from '{selected_category.upper()}' knowledge base (streaming)...")
-                    if metadata_filter:
-                        print(f"  Applying metadata filter: {metadata_filter}")
-                        retriever = current_vectorstore.as_retriever(filter=metadata_filter)
-                    else:
-                        retriever = current_vectorstore.as_retriever()
-                    retrieved_docs.extend(retriever.get_relevant_documents(query_text_for_llm))
-                else:
-                    print(f"{ANSI_BLUE}Full news knowledge base not loaded. Skipping detailed news search.{ANSI_RESET}") 
-
-            elif selected_category == 'all':
-                print(f"Searching and generating response from {ANSI_BLUE}ALL{ANSI_RESET} active knowledge bases (streaming)...") 
-                
+            if selected_category == 'news_summaries':
                 if NEWS_SUMMARIES_KB_NAME in knowledge_bases:
-                    print(f"  Querying {NEWS_SUMMARIES_KB_NAME.upper()} (for news overview)...")
-                    news_sum_retriever = knowledge_bases[NEWS_SUMMARIES_KB_NAME].as_retriever(search_kwargs={"k": 20}) 
-                    news_summary_retrieved_raw = news_sum_retriever.get_relevant_documents(query_text_for_llm)
-                    
-                    # Deduplicate news summaries even in 'all' mode, using file_path
-                    unique_news_sum_map = {}
-                    for doc in news_summary_retrieved_raw:
-                        doc_key = doc.metadata.get("file_path")
-                        if doc_key and doc_key not in unique_news_sum_map:
-                            unique_news_sum_map[doc_key] = doc
-                    news_summary_retrieved = list(unique_news_sum_map.values())
-                    print(f"  Retrieved {len(news_summary_retrieved_raw)} raw summaries, kept {len(news_summary_retrieved)} unique summaries for 'ALL' query.")
-
-
-                    if news_summary_retrieved:
-                        news_sum_context_parts = []
-                        for doc in news_summary_retrieved:
-                            title = doc.metadata.get("original_title", "No Title")
-                            summary = doc.page_content 
-                            source_info = doc.metadata.get("source", "Unknown Source")
-                            site_origin = doc.metadata.get("site_origin", "Unknown Site")
-                            # Formatted with ANSI colors directly for the LLM prompt
-                            news_sum_context_parts.append(f"- Source: {source_info}, Site: {site_origin}, {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}{title}{ANSI_RESET}, {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}{summary}{ANSI_RESET}")
-                        context_str = "\n".join(news_sum_context_parts) # Define context_str here for 'all' + news_summaries
-                        retrieved_docs.append(LcDocument(page_content=context_str, metadata={"source": "News Headlines Overview"}))
-                        print(f"  Added {len(news_sum_context_parts)} news summaries to context.")
-                    else:
-                        print(f"  No relevant news summaries found for 'ALL' query.")
-
-                for kb_name, kb_store in knowledge_bases.items():
-                    if kb_name not in ['news_full', NEWS_SUMMARIES_KB_NAME]: 
-                        print(f"  Querying {kb_name.upper()} knowledge base (full content)...")
-                        retriever = kb_store.as_retriever() 
-                        retrieved_docs.extend(retriever.get_relevant_documents(query_text_for_llm))
-                    elif kb_name == 'news_full':
-                        pass 
-            
-            else: # General category query (misc, sec, legal)
-                current_vectorstore = knowledge_bases.get(selected_category)
-                if current_vectorstore:
-                    print(f"Searching and generating response from '{selected_category.upper()}' knowledge base (streaming)...")
-                    retriever = current_vectorstore.as_retriever()
-                    retrieved_docs.extend(retriever.get_relevant_documents(query_text_for_llm))
+                    handle_news_summary_query(llm, knowledge_bases[NEWS_SUMMARIES_KB_NAME], 
+                                              original_query_text, query_text_for_llm, 
+                                              metadata_filter, HEADLINE_SUMMARIZER_PROMPT, 
+                                              SYSTEM_INSTRUCTION_PROMPT)
                 else:
-                    print(f"{ANSI_BLUE}Knowledge base '{selected_category}' not loaded. Skipping search.{ANSI_RESET}") 
-
-
-            if not retrieved_docs and not is_headline_request: 
-                # This handles cases like a general query with no results
-                print(f"{ANSI_BLUE}No relevant documents found in the selected knowledge base(s) for your query.{ANSI_RESET}") 
-                continue # Go back to the beginning of the while loop
-
-            elif not retrieved_docs and is_headline_request: 
-                # This handles headline requests with no relevant summaries found
-                print(f"{ANSI_BLUE}No relevant news summaries found. The LLM will try to answer based on general knowledge.{ANSI_RESET}") 
-                context_str = "" # Explicitly empty context for LLM to use general knowledge
-                user_query_content = f"Question: {original_query_text}\nAnswer:"
-                messages_for_llm = [
-                    {"role": "system", "content": SYSTEM_INSTRUCTION_PROMPT},
-                    {"role": "user", "content": user_query_content}
+                    print(f"{ANSI_BLUE}News summaries knowledge base not loaded. Cannot provide headline overview.{ANSI_RESET}")
+            elif selected_category in ['misc', 'sec', 'legal', 'news_full']:
+                handle_general_query(llm, knowledge_bases, original_query_text, 
+                                     query_text_for_llm, selected_category, SYSTEM_INSTRUCTION_PROMPT)
+            elif selected_category == 'auto': # Fallback for general queries not caught by headline detection
+                # This means it's not a headline query, and no specific KB was selected.
+                # Query all general content KBs.
+                content_kbs_for_auto_query = [
+                    kb for kb in knowledge_bases if kb not in [NEWS_SUMMARIES_KB_NAME]
                 ]
-            else: # This block is reached if retrieved_docs is NOT empty (either headline or non-headline)
-                if not is_headline_request: # If it's a non-headline query with retrieved docs
-                    context_parts = []
-                    for doc in retrieved_docs:
-                        source_info = doc.metadata.get("source", "Unknown Source")
-                        original_title = doc.metadata.get("original_title")
-                        title_part = f", Title: {original_title}" if original_title else ""
-                        context_parts.append(f"Source: {source_info}{title_part}\nContent: {doc.page_content}")
-                    context_str = "\n\n".join(context_parts)
-                    
-                    user_query_content = f"""Context:
-{context_str}
-
-Question: {original_query_text} 
-
-Please summarize the information in the provided context, identifying and creating distinct, relevant sections based on the content. Provide key points under each section in bullet points. If information for a category is not found, you can omit that category or state that the information is not available in the document.
-
-Answer:"""
-                    messages_for_llm = [
-                        {"role": "system", "content": SYSTEM_INSTRUCTION_PROMPT},
-                        {"role": "user", "content": user_query_content}
-                    ]
-                # If is_headline_request is true AND retrieved_docs is populated,
-                # context_str and messages_for_llm are *already set* in the
-                # 'if is_headline_request:' block directly above this.
-                # No 'else' is needed here, as the variables are guaranteed to be defined.
-
-
-            print("\n--- Answer (Streaming) ---")
-            print(ANSI_BLUE, end="", flush=True) 
-            full_response_content = ""
-            for chunk in llm.stream(messages_for_llm):
-                if chunk.content:
-                    print(chunk.content, end="", flush=True)
-                    full_response_content += chunk.content
-            print(ANSI_RESET) 
-            print("\n")
+                if content_kbs_for_auto_query:
+                    handle_general_query(llm, knowledge_bases, original_query_text, 
+                                         query_text_for_llm, content_kbs_for_auto_query, 
+                                         SYSTEM_INSTRUCTION_PROMPT)
+                else:
+                    print(f"{ANSI_BLUE}No general content knowledge bases loaded to answer your query.{ANSI_RESET}")
+            else:
+                # This block should ideally not be hit with good routing, but for safety:
+                print(f"{ANSI_BLUE}Could not determine query type or find relevant knowledge base for '{user_input}'. Please try 'help' for options.{ANSI_RESET}")
 
     except KeyboardInterrupt:
         print(f"{ANSI_RESET}\nResponse generation stopped by user.{ANSI_RESET}") 

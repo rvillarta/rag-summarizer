@@ -27,7 +27,7 @@ from selenium.webdriver.chrome.options import Options # FIX: Added missing impor
 # Base directory where extracted content will be saved (now specifically for news)
 BASE_OUTPUT_DIR = Path("./data/news")
 # Maximum number of articles to scrape per site to prevent excessive downloads
-MAX_ARTICLES_TO_SCRAPE_PER_SITE = 50 
+MAX_ARTICLES_TO_SCRAPE_PER_SITE = 100
 # Delay between requests to avoid overwhelming the server (in seconds)
 REQUEST_DELAY = 1 
 # Path to the file containing a list of URLs to scrape
