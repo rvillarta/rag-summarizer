@@ -22,7 +22,7 @@ import json
 ANSI_YELLOW = "\033[1;33m" # Bright Yellow
 ANSI_BLUE = "\033[1;34m"   # Bright Blue
 ANSI_RESET = "\033[0m"    # Reset to default terminal color
-ANSI_ORANGE = "\033[38;5;208m"  # Orange
+ANSI_ORANGE = "\033[38;5;208m" # Corrected ANSI Orange code
 ANSI_LIGHT_BLUE = "\033[94m"   # Light Blue
 
 # --- Configuration ---
@@ -51,7 +51,7 @@ LLAMAFILE_LOG_FILE = "llamafile_server.log"
 
 # --- LLM Prompts (Defined globally as they are constant) ---
 
-# NEW: Simplified Headline Summarizer Prompt for direct listing
+# NEW: Headline Summarizer Prompt for direct listing
 # This prompt will now be used ONLY when the LLM is involved in synthesizing summaries.
 # For direct file system reads, the app will format the output directly.
 HEADLINE_SUMMARIZER_PROMPT = f"""You are a helpful assistant.
@@ -536,7 +536,7 @@ def parse_user_input(user_input, available_kbs_keys):
     is_summary_req_auto_detected = False
     if selected_category == 'auto' and is_headline_query(original_query_text):
         is_summary_req_auto_detected = True
-        # If it's a headline query and no specific KB was explicitly chosen,
+        # If it's a headline query and no explicit KB was explicitly chosen,
         # then route to direct file system retrieval.
         if not any(prefix.lower() + ':' in original_query_text.lower() for prefix in available_kbs_keys):
             selected_category = 'direct_headlines'
@@ -549,7 +549,7 @@ def parse_user_input(user_input, available_kbs_keys):
         else: # It's a headline query, but an explicit KB was given (e.g., NEWS_SUMMARIES:), so route to that KB's summary handler
             if "blog" in original_query_text.lower():
                 selected_category = 'blog_summaries'
-            elif "social media" in original_query_text.lower() or "trending" in original_query_text.lower():
+            elif "social media" in original_query.lower() or "trending" in original_query_text.lower():
                 selected_category = 'social_media_summaries'
             else:
                 selected_category = 'news_summaries'
@@ -575,7 +575,7 @@ def parse_user_input(user_input, available_kbs_keys):
 # --- New Function: get_headlines_from_filesystem ---
 def get_headlines_from_filesystem(original_query_text, metadata_filter):
     """
-    Retrieves and prints headlines directly from news JSON files on the file system,
+    Retrieves and returns headlines directly from news JSON files on the file system,
     applying date and site filters. No LLM or ChromaDB involvement.
     """
     print(f"Retrieving headlines directly from file system for '{original_query_text}'...")
@@ -616,6 +616,7 @@ def get_headlines_from_filesystem(original_query_text, metadata_filter):
                                     if filter_key == "publication_date":
                                         # Parse doc_value (e.g., "2025-08-20_14-40-25") into datetime object
                                         try:
+                                            # Corrected parsing format for publication_date from JSON
                                             doc_datetime = datetime.strptime(doc_value, "%Y-%m-%d_%H-%M-%S")
                                         except ValueError:
                                             print(f"  Warning: Could not parse publication_date '{doc_value}' from {file_name}. Skipping date filter for this doc.")
@@ -651,16 +652,8 @@ def get_headlines_from_filesystem(original_query_text, metadata_filter):
                     except Exception as e:
                         print(f"  Error processing {file_name}: {e}.")
 
-    if not retrieved_headlines:
-        print(f"{ANSI_BLUE}No headlines found matching your criteria.{ANSI_RESET}")
-    else:
-        print("\n--- Retrieved Headlines (Direct from File System) ---")
-        for i, item in enumerate(retrieved_headlines):
-            print(f"{i+1}. {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}{item['title']}{ANSI_RESET}")
-            print(f"   {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}{item['summary']}{ANSI_RESET}")
-            print(f"   (Source: {item['source']}, Site: {item['site_origin']})")
-            print("-" * 20)
-        print("--- END HEADLINES ---")
+    # Return the list of headlines instead of printing directly
+    return retrieved_headlines
 
 
 # --- Renamed and Updated Summary Handler Function ---
@@ -688,14 +681,12 @@ def handle_summary_query(llm, summary_vectorstore, original_query_text, query_te
                     if "$lte" in v:
                         conditions.append({"publication_date": {"$lte": v["$lte"]}})
                 else:
-                    # For other simple key-value pairs or other operators, add directly
                     conditions.append({k: v})
             
             if len(conditions) == 1:
                 chroma_where_clause = conditions[0]
             elif len(conditions) > 1:
                 chroma_where_clause = {"$and": conditions}
-            # If conditions is empty, chroma_where_clause remains {}, which is correct for no filter
 
         print(f"  DEBUG: Initial metadata_filter: {metadata_filter}")
         print(f"  DEBUG: Constructed chroma_where_clause: {chroma_where_clause}")
@@ -1070,8 +1061,54 @@ def main():
             # NEW: Handle 'direct_headlines' category for file system read
             if selected_category == 'direct_headlines':
                 print(f"Retrieving headlines directly from file system for '{original_query_text}'...")
-                # The get_headlines_from_filesystem function will handle filtering and printing
-                get_headlines_from_filesystem(original_query_text, metadata_filter)
+                # The get_headlines_from_filesystem function will handle filtering and returning data
+                retrieved_headlines_list = get_headlines_from_filesystem(original_query_text, metadata_filter)
+                
+                if not retrieved_headlines_list:
+                    print(f"{ANSI_BLUE}No headlines found matching your criteria from the file system.{ANSI_RESET}")
+                else:
+                    # Format the retrieved headlines for the LLM's context
+                    llm_context_for_executive_summary = []
+                    for item in retrieved_headlines_list:
+                        llm_context_for_executive_summary.append(
+                            f"- Source: {item['source']}, Site: {item['site_origin']}, Title: {item['title']}, Summary: {item['summary']}"
+                        )
+                    context_str_for_llm = "\n".join(llm_context_for_executive_summary)
+
+                    # Prepare messages for LLM to generate the executive summary
+                    executive_summary_prompt = f"""You are a brilliant news analyst.
+Given the following list of news article titles and their brief summaries, provide a concise executive summary of the key themes and most important developments.
+Group related articles by theme and provide a brief overview for each theme.
+Do NOT list individual articles in this executive summary. Focus on the overarching narrative.
+
+Input Headlines and Summaries:
+{context_str_for_llm}
+
+Executive Summary:"""
+                    
+                    messages_for_llm = [
+                        {"role": "system", "content": SYSTEM_INSTRUCTION_PROMPT},
+                        {"role": "user", "content": executive_summary_prompt}
+                    ]
+
+                    # Print the LLM's executive summary first
+                    print("\n--- Executive News Briefing ---")
+                    print(ANSI_BLUE, end="", flush=True)
+                    for chunk in llm.stream(messages_for_llm):
+                        if chunk.content:
+                            print(chunk.content, end="", flush=True)
+                    print(ANSI_RESET)
+                    print("\n--- End Executive Briefing ---\n")
+
+                    # Then, print the original list of headlines
+                    print("\n--- Retrieved Headlines (Direct from File System) ---")
+                    for i, item in enumerate(retrieved_headlines_list):
+                        print(f"{i+1}. {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}{item['title']}{ANSI_RESET}")
+                        print(f"   {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}{item['summary']}{ANSI_RESET}")
+                        print(f"   (Source: {item['source']}, Site: {item['site_origin']})")
+                        print("-" * 20)
+                    print("--- END HEADLINES ---")
+                
                 continue # Skip the rest of the loop and prompt for next question
 
             # Existing logic for summary KBs (now only for LLM synthesis)
@@ -1118,3 +1155,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
