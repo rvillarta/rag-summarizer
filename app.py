@@ -7,7 +7,7 @@ from docx import Document
 from langchain_community.document_loaders import TextLoader, PyPDFLoader, UnstructuredHTMLLoader
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_community.vectorstores import Chroma
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter 
 from langchain.chains import RetrievalQA
 from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
@@ -22,7 +22,7 @@ import json
 ANSI_YELLOW = "\033[1;33m" # Bright Yellow
 ANSI_BLUE = "\033[1;34m"   # Bright Blue
 ANSI_RESET = "\033[0m"    # Reset to default terminal color
-ANSI_ORANGE = "\033[38;5;208m" # Orange
+ANSI_ORANGE = "\033[38;5;208m"  # Orange
 ANSI_LIGHT_BLUE = "\033[94m"   # Light Blue
 
 # --- Configuration ---
@@ -34,6 +34,10 @@ MISC_DIR = BASE_DATA_DIR / "misc"
 SEC_DIR = BASE_DATA_DIR / "sec"
 LEGAL_DIR = BASE_DATA_DIR / "legal"
 NEWS_DIR = BASE_DATA_DIR / "news" # Directory for raw news articles (text + json)
+
+# NEW: Directories for blogs and social media content
+BLOG_DIR = BASE_DATA_DIR / "blogs" 
+SOCIAL_MEDIA_DIR = BASE_DATA_DIR / "social_media"
 
 # Base directory for all vector stores (each will get its own subdirectory)
 BASE_VECTOR_DB_DIR = Path("vectorstores") 
@@ -47,34 +51,14 @@ LLAMAFILE_LOG_FILE = "llamafile_server.log"
 
 # --- LLM Prompts (Defined globally as they are constant) ---
 
-# Headline Summarizer Prompt: Using f-string to embed ANSI escape codes directly.
-HEADLINE_SUMMARIZER_PROMPT = f"""You are a brilliant news analyst.
-Given a list of news article titles and their brief summaries, your primary goal is to provide a diverse and distinct overview of the day's events.
-Group the articles into logical themes or categories. For each theme:
-1. Provide a very concise, unique overview of that theme.
-2. Then, list each *individual* original title and its brief summary that falls under that theme. Ensure each listed item is distinct.
-   Format each article entry as: "{ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}[Article Title]{ANSI_RESET} {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}[Article Summary]{ANSI_RESET}"
-   Make sure to include the ANSI color codes as specified.
-If an article title/summary does not clearly fit into a theme, list it under an "Other News" category.
-Prioritize distinct, informative headlines and their specific summaries. Avoid blending or over-generalizing the summaries. Focus on presenting a clear, varied picture of the news.
-
-Example Input Format:
-- Source: foxnews_article1.txt, Title: Trump Rally Draws Large Crowd, Summary: President Donald Trump held a massive rally in Arizona, addressing supporters on various political issues.
-- Source: cnn_article2.txt, Title: Global Markets React to Economic Data, Summary: Stock markets worldwide saw significant movement following the release of new economic indicators.
-- Source: rt_article3.txt, Title: Ukraine Conflict Update, Summary: Latest reports from the front lines of the Ukraine conflict, including diplomatic efforts.
-
-Example Output Format:
-**Political News**
-- Overview: Recent political gatherings and statements are influencing public discourse.
-  - {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}Trump Rally Draws Large Crowd{ANSI_RESET} {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}President Donald Trump held a massive rally in Arizona, addressing supporters on various political issues.{ANSI_RESET}
-  - {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}Senator Smith Announces Re-election Bid{ANSI_RESET} {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}Senator Smith confirmed her intention to run for re-election, focusing on economic policy.{ANSI_RESET}
-
-**Global Economy**
-- Overview: International financial markets are responding to new economic figures.
-  - {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}Global Markets React to Economic Data{ANSI_RESET} {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}Stock markets worldwide saw significant movement following the release of new economic indicators.{ANSI_RESET}
-
-**Other News**
-- {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}Ukraine Conflict Update{ANSI_RESET} {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}Latest reports from the front lines of the Ukraine conflict, including diplomatic efforts.{ANSI_RESET}
+# NEW: Simplified Headline Summarizer Prompt for direct listing
+# This prompt will now be used ONLY when the LLM is involved in synthesizing summaries.
+# For direct file system reads, the app will format the output directly.
+HEADLINE_SUMMARIZER_PROMPT = f"""You are a helpful assistant.
+Given a list of news article titles and their brief summaries, your task is to present them clearly.
+Do NOT attempt to group them into themes or categories. Simply list each article entry as provided.
+Format each article entry exactly as: "{ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}[Article Title]{ANSI_RESET} {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}[Article Summary]{ANSI_RESET}"
+Make sure to include the ANSI color codes as specified.
 
 Actual Input:
 {{context}}
@@ -93,14 +77,18 @@ If the answer cannot be found in the provided document, explicitly state: "Infor
 
 def is_headline_query(query):
     """
-    Determines if a query is likely a request for news headlines/overview.
+    Determines if a query is likely a request for general news headlines/overview,
+    or general summaries (blogs, social media).
     More flexible matching.
     """
     query_lower = query.lower()
     headline_keywords = [
         "summarize headlines", "latest news", "news overview", "recent news",
         "daily briefing", "what's the news", "tell me about the news", "whats happening",
-        "headlines", "news" # Single words, if present, are strong indicators
+        "headlines", "news", # News specific
+        "summarize blogs", "blog updates", "blog summaries", "blog posts", # Blog specific
+        "summarize social media", "social media trends", "what's trending", "social media overview", # Social media specific
+        "get headlines", "list headlines" # Explicit keywords for direct retrieval
     ]
     # If any of these keywords are present, and it's not explicitly asking for "details" or "full article"
     if any(keyword in query_lower for keyword in headline_keywords):
@@ -164,13 +152,13 @@ def parse_date_and_site_from_query(query):
                 start_date = specific_date.replace(hour=0, minute=0, second=0, microsecond=0)
                 end_date = specific_date.replace(hour=23, minute=59, second=59, microsecond=999999)
                 filters["publication_date"] = {"$gte": start_date.isoformat(), "$lte": end_date.isoformat()}
-                cleaned_query = cleaned_query.replace(date_str, "").strip()
+                cleaned_query = re.sub(pattern, '', cleaned_query, flags=re.IGNORECASE).strip()
                 date_filter_applied = True
             except ValueError:
                 pass # Invalid date format, continue without date filter
 
     # --- Site Parsing ---
-    # Extended regex to catch common names or full domains
+    # Extended regex to catch common names or full domains. Added general site keywords.
     site_patterns = {
         r'\bfox\s*news(?:\.com)?\b': 'foxnews.com',
         r'\bcnn(?:\.com)?\b': 'cnn.com',
@@ -182,7 +170,12 @@ def parse_date_and_site_from_query(query):
         r'\btass(?:\.com)?\b': 'tass.com',
         r'\beuronews(?:\.com)?\b': 'euronews.com',
         r'\baljazeera(?:\.com)?\b': 'aljazeera.com',
-        r'\becns(?:\.cn)?\b': 'ecns.cn'
+        r'\becns(?:\.cn)?\b': 'ecns.cn',
+        # Add common blog/social media sites here if you're consistently scraping them with site_origin metadata
+        r'\bmedium(?:\.com)?\b': 'medium.com',
+        r'\breddit(?:\.com)?\b': 'reddit.com',
+        r'\btwitter(?:\.com)?\b': 'twitter.com', # Assuming you'd get these from social media scrapes
+        r'\bx\.com(?:\/.*)?\b': 'x.com' # New Twitter domain
     }
 
     site_match_found = False
@@ -226,20 +219,17 @@ def load_documents_from_directory(directory: Path, load_summaries=False, summary
         return []
 
     # Determine the starting point for os.walk based on the directory type
-    # For NEWS_DIR, we expect a nested structure (site_timestamp_folder) but can fall back
-    # For MISC, SEC, LEGAL, we expect files directly or in simple subfolders
     dirs_to_walk = []
     if directory == NEWS_DIR:
         # Check for timestamped subdirectories first
-        potential_subdirs = [d for d in directory.iterdir() if d.is_dir()]
+        potential_subdirs = [d for d in directory.iterdir() if d.is_dir()] 
         if potential_subdirs:
             dirs_to_walk.extend(potential_subdirs)
         else:
             # If no subdirs, treat NEWS_DIR itself as the starting point for walk
             print(f"  Info: No timestamped subdirectories found in {directory}. Scanning {directory} directly for news.")
             dirs_to_walk = [directory]
-    else:
-        # For MISC, SEC, LEGAL, always start walk from the main directory
+    else: # For MISC, SEC, LEGAL, BLOG, SOCIAL_MEDIA, always start walk from the main directory
         dirs_to_walk = [directory]
 
     # If no directories to walk (e.g., NEWS_DIR is empty and has no subdirs), return early
@@ -250,18 +240,18 @@ def load_documents_from_directory(directory: Path, load_summaries=False, summary
     for start_dir in dirs_to_walk:
         for root, _, files in os.walk(start_dir):
             for file_name in files:
-                file_path = os.path.join(root, file_name)
-                # Ensure we are not trying to load non-txt files as text with a json metadata expectation
+                file_path = os.path.join(root, file_name) # Define file_path here
                 
                 # Logic for .txt files
                 if file_name.endswith(".txt"):
                     metadata_file_path = Path(file_path).with_suffix('.json')
-                    # If it's a news directory or explicitly loading summaries, we expect JSON metadata
-                    if load_summaries or directory == NEWS_DIR: 
+                    
+                    if load_summaries or directory in [NEWS_DIR, BLOG_DIR, SOCIAL_MEDIA_DIR]: 
                         if metadata_file_path.exists():
                             try:
                                 with open(metadata_file_path, 'r', encoding='utf-8') as f:
                                     metadata = json.load(f)
+                                    
                                     if "publication_date" in metadata and isinstance(metadata["publication_date"], str):
                                         try:
                                             parsed_dt = datetime.strptime(metadata["publication_date"], "%Y-%m-%d_%H-%M-%S")
@@ -272,7 +262,7 @@ def load_documents_from_directory(directory: Path, load_summaries=False, summary
                                     content_to_load = ""
                                     if load_summaries and "article_summary" in metadata:
                                         content_to_load = metadata["article_summary"]
-                                    elif not load_summaries: # Default to full text if not loading summaries
+                                    elif not load_summaries: 
                                         loader = TextLoader(file_path, encoding='utf-8')
                                         docs_from_loader = loader.load()
                                         if docs_from_loader:
@@ -281,10 +271,15 @@ def load_documents_from_directory(directory: Path, load_summaries=False, summary
                                     if content_to_load:
                                         doc_metadata = {
                                             "source": file_name, 
-                                            "file_path": file_path,
+                                            "file_path": file_path, 
                                             "category": summary_kb_name if load_summaries and summary_kb_name else directory.name
                                         }
-                                        doc_metadata.update(metadata)
+                                        if "site_origin" in metadata and metadata["site_origin"].startswith("www."):
+                                            metadata["site_origin"] = metadata["site_origin"][4:] 
+                                        doc_metadata.update(metadata) 
+                                        
+                                        print(f"    DEBUG: Loaded doc: {file_name}, Site: {doc_metadata.get('site_origin')}, Summary Length: {len(content_to_load)}")
+
                                         documents.append(LcDocument(page_content=content_to_load, metadata=doc_metadata))
                                     else:
                                         print(f"    Skipping {file_name}: No content (or summary) to load from JSON/text.")
@@ -292,51 +287,51 @@ def load_documents_from_directory(directory: Path, load_summaries=False, summary
                                 print(f"    Error reading JSON metadata for {file_name}: {e}. Skipping metadata and text loading.")
                             except Exception as e:
                                 print(f"    Error processing {file_name}: {e}.")
-                        else: # If JSON metadata is expected (news or summaries) but not found, just load the text file
+                        else: 
                             try:
                                 loader = TextLoader(file_path, encoding='utf-8')
                                 docs_from_loader = loader.load()
                                 for doc in docs_from_loader:
                                     doc.metadata["category"] = directory.name
                                     doc.metadata["source"] = file_name 
-                                    doc.metadata["file_path"] = file_path
+                                    doc.metadata["file_path"] = file_path 
                                     documents.append(doc)
                             except Exception as e:
                                 print(f"    Error loading text file {file_name}: {e}")
-                    else: # For non-news TXT files where JSON metadata is NOT expected
+                    else: 
                         try:
                             loader = TextLoader(file_path, encoding='utf-8')
                             docs_from_loader = loader.load()
                             for doc in docs_from_loader:
                                 doc.metadata["category"] = directory.name
                                 doc.metadata["source"] = file_name 
-                                doc.metadata["file_path"] = file_path
+                                doc.metadata["file_path"] = file_path 
                                 documents.append(doc)
                         except Exception as e:
                             print(f"    Error loading text file {file_name}: {e}")
                 
                 # Logic for non-TXT files (DOCX, PDF, HTML) - only loaded if not in summary mode
-                elif not load_summaries: 
+                elif not load_summaries and (file_name.endswith(".docx") or file_name.endswith(".pdf") or file_name.endswith(".html") or file_name.endswith(".htm")): 
                     try:
                         if file_name.endswith(".docx"):
                             print(f"    Loading DOCX file: {file_name}")
-                            text_content = extract_text_from_docx(file_path)
+                            text_content = extract_text_from_docx(file_path) 
                             if text_content:
                                 documents.append(LcDocument(page_content=text_content, metadata={"source": file_name, "file_path": file_path, "category": directory.name}))
                         elif file_name.endswith(".pdf"):
                             print(f"    Loading PDF file: {file_name}")
                             try:
-                                loader = PyPDFLoader(file_path)
+                                loader = PyPDFLoader(file_path) 
                                 docs = loader.load()
                                 for doc in docs:
                                     doc.metadata["category"] = directory.name
                                     doc.metadata["source"] = file_name 
-                                    doc.metadata["file_path"] = file_path
+                                    doc.metadata["file_path"] = file_path 
                                     documents.append(doc)
                             except ImportError:
                                 print(f"    Skipping PDF file {file_name}: 'pypdf' not installed. Please install with `pip install pypdf`.")
                             except Exception as pdf_e:
-                                print(f"    Error loading PDF file {file_name}: {pdf_e}. Ensure 'pypdf' is installed and the PDF is not corrupted.")
+                                print(f"    Error loading PDF file {file_name}: {pdf_e}. Ensure 'pypdf' is installed and the PDF is not corrupted.") 
                         elif file_name.endswith(".html") or file_name.endswith(".htm"):
                             print(f"    Loading HTML file: {file_name}")
                             if directory == SEC_DIR:
@@ -360,21 +355,21 @@ def load_documents_from_directory(directory: Path, load_summaries=False, summary
                                     print(f"    Error parsing HTML file {file_name} (SEC) with BeautifulSoup: {bs_e}.")
                             else:
                                 try:
-                                    loader = UnstructuredHTMLLoader(file_path)
+                                    loader = UnstructuredHTMLLoader(file_path) 
                                     docs = loader.load()
                                     for doc in docs:
                                         doc.metadata["category"] = directory.name
                                         doc.metadata["source"] = file_name 
-                                        doc.metadata["file_path"] = file_path
+                                        doc.metadata["file_path"] = file_path 
                                         documents.extend(docs) 
                                 except ImportError:
                                     print(f"    Skipping HTML file {file_name}: 'unstructured' or its dependencies not installed. Please install with `pip install unstructured`.")
                                 except Exception as unstr_e:
                                     print(f"    Error loading HTML file {file_name} with UnstructuredHTMLLoader: {unstr_e}.")
-                    except Exception as e: # Catch all other potential errors during file loading
+                    except Exception as e: 
                         print(f"    An unexpected error occurred loading {file_name} as {file_name.split('.')[-1].upper()} file: {e}")
-                else:
-                    print(f"    Skipping unsupported file type or not loading full content for summary mode: {file_name}")
+                # IMPORTANT: No 'else' here to specifically skip JSON files, as they are only processed as metadata
+                # for .txt files and should not be treated as standalone documents.
 
     print(f"  Loaded {len(documents)} documents from {directory}.")
     return documents
@@ -386,7 +381,7 @@ def initialize_vector_store_for_category(documents, category_name: str, use_summ
     Each category gets its own persistent directory within BASE_VECTOR_DB_DIR.
     If use_summaries is True, it expects documents loaded with summaries as page_content.
     """
-    category_db_path = BASE_VECTOR_DB_DIR / category_name
+    category_db_path = BASE_DATA_DIR / "vectorstores" / category_name
     print(f"Initializing embeddings model for {category_name}...")
     embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
 
@@ -514,7 +509,7 @@ def initialize_llm_for_summarization():
         print(f"Error initializing LLM for scraper summarization: {e}")
         return None
 
-# --- New Helper for Parsing User Input ---
+# --- Helper for Parsing User Input ---
 def parse_user_input(user_input, available_kbs_keys):
     """
     Parses user input to determine selected category, query text, and metadata filters.
@@ -537,51 +532,220 @@ def parse_user_input(user_input, available_kbs_keys):
             print(f"{ANSI_BLUE}Invalid category '{category_prefix}'. Attempting intelligent routing.{ANSI_RESET}")
             # selected_category remains 'auto' for intelligent routing/fallback
 
-    # Determine if it's a headline request for auto-routing
-    is_headline_req_auto_detected = False
+    # Determine if it's a summary request (news, blog, social media) for auto-routing
+    is_summary_req_auto_detected = False
     if selected_category == 'auto' and is_headline_query(original_query_text):
-        is_headline_req_auto_detected = True
-        selected_category = 'news_summaries' # Force to news_summaries if auto-detected as headline
+        is_summary_req_auto_detected = True
+        # If it's a headline query and no specific KB was explicitly chosen,
+        # then route to direct file system retrieval.
+        if not any(prefix.lower() + ':' in original_query_text.lower() for prefix in available_kbs_keys):
+            selected_category = 'direct_headlines'
+            # Parse date and site filters from the original query, these will be used by get_headlines_from_filesystem
+            parsed_filter, cleaned_query_after_filter = parse_date_and_site_from_query(original_query_text)
+            if parsed_filter:
+                metadata_filter = parsed_filter
+                query_text_for_llm = cleaned_query_after_filter # Cleaned query for potential future semantic search if needed
+            # If no explicit filters, query_text_for_llm remains original_query_text
+        else: # It's a headline query, but an explicit KB was given (e.g., NEWS_SUMMARIES:), so route to that KB's summary handler
+            if "blog" in original_query_text.lower():
+                selected_category = 'blog_summaries'
+            elif "social media" in original_query_text.lower() or "trending" in original_query_text.lower():
+                selected_category = 'social_media_summaries'
+            else:
+                selected_category = 'news_summaries'
+            # Parse date and site filters for the chosen summary KB
+            parsed_filter, cleaned_query_after_filter = parse_date_and_site_from_query(original_query_text)
+            if parsed_filter:
+                metadata_filter = parsed_filter
+                query_text_for_llm = cleaned_query_after_filter
+            # If no specific filter was found, query_text_for_llm remains original_query_text
 
-    # Parse date and site filters if it's a headline request (explicit or auto-detected)
-    if selected_category == 'news_summaries':
-        parsed_filter, cleaned_query_after_filter = parse_date_and_site_from_query(original_query_text)
-        if parsed_filter:
-            metadata_filter = parsed_filter
-            query_text_for_llm = cleaned_query_after_filter 
-        # If no specific filter was found, query_text_for_llm remains original_query_text
+
+    # If an explicit summary KB was selected (e.g., NEWS_SUMMARIES:), apply filters for that KB
+    # This block is now redundant because the logic above handles it.
+    # if selected_category in ['news_summaries', 'blog_summaries', 'social_media_summaries'] and not is_summary_req_auto_detected:
+    #     parsed_filter, cleaned_query_after_filter = parse_date_and_site_from_query(original_query_text)
+    #     if parsed_filter:
+    #         metadata_filter = parsed_filter
+    #         query_text_for_llm = cleaned_query_after_filter 
+    #     # If no specific filter was found, query_text_for_llm remains original_query_text
 
     return selected_category, original_query_text, query_text_for_llm, metadata_filter
 
-# --- New Handler Functions ---
-
-def handle_news_summary_query(llm, news_summaries_vectorstore, original_query_text, query_text_for_llm, metadata_filter, HEADLINE_SUMMARIZER_PROMPT, SYSTEM_INSTRUCTION_PROMPT):
+# --- New Function: get_headlines_from_filesystem ---
+def get_headlines_from_filesystem(original_query_text, metadata_filter):
     """
-    Handles queries specifically for news headlines/summaries.
+    Retrieves and prints headlines directly from news JSON files on the file system,
+    applying date and site filters. No LLM or ChromaDB involvement.
     """
-    NEWS_SUMMARIES_KB_NAME = "news_summaries" # Ensure this is consistent
-    print(f"Searching and generating high-level news overview from '{NEWS_SUMMARIES_KB_NAME.upper()}' knowledge base (streaming)...")
+    print(f"Retrieving headlines directly from file system for '{original_query_text}'...")
     
-    if news_summaries_vectorstore:
+    retrieved_headlines = []
+    
+    # Iterate through NEWS_DIR to find timestamped site folders
+    dirs_to_walk = []
+    potential_subdirs = [d for d in NEWS_DIR.iterdir() if d.is_dir()] 
+    if potential_subdirs:
+        dirs_to_walk.extend(potential_subdirs)
+    else:
+        dirs_to_walk = [NEWS_DIR] # Fallback if no timestamped subdirs
+
+    for start_dir in dirs_to_walk:
+        for root, _, files in os.walk(start_dir):
+            for file_name in files:
+                if file_name.endswith(".json"): # Only process JSON metadata files
+                    file_path = os.path.join(root, file_name)
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            metadata = json.load(f)
+                            
+                            # Normalize site_origin from www.domain.com to domain.com if present
+                            if "site_origin" in metadata and metadata["site_origin"].startswith("www."):
+                                metadata["site_origin"] = metadata["site_origin"][4:]
+
+                            # Apply filters
+                            match = True
+                            if metadata_filter:
+                                for filter_key, filter_value in metadata_filter.items():
+                                    if filter_key not in metadata:
+                                        match = False
+                                        break
+                                    
+                                    doc_value = metadata[filter_key]
+                                    
+                                    if filter_key == "publication_date":
+                                        # Parse doc_value (e.g., "2025-08-20_14-40-25") into datetime object
+                                        try:
+                                            doc_datetime = datetime.strptime(doc_value, "%Y-%m-%d_%H-%M-%S")
+                                        except ValueError:
+                                            print(f"  Warning: Could not parse publication_date '{doc_value}' from {file_name}. Skipping date filter for this doc.")
+                                            match = False # Treat as non-match if date unparseable
+                                            break
+
+                                        # Parse filter_value's $gte and $lte into datetime objects
+                                        # These filter values come from parse_date_and_site_from_query and are already ISO format
+                                        filter_start_dt = datetime.fromisoformat(filter_value["$gte"])
+                                        filter_end_dt = datetime.fromisoformat(filter_value["$lte"])
+
+                                        if not (filter_start_dt <= doc_datetime <= filter_end_dt):
+                                            match = False
+                                            break
+                                    elif doc_value != filter_value: # Simple exact match for site_origin
+                                        match = False
+                                        break
+                            
+                            if match:
+                                title = metadata.get("original_title", "No Title Available")
+                                summary = metadata.get("article_summary", "No Summary Available")
+                                site_origin = metadata.get("site_origin", "Unknown Site")
+                                source_filename = Path(file_path).name # Just the filename for source
+                                
+                                retrieved_headlines.append({
+                                    "title": title,
+                                    "summary": summary,
+                                    "site_origin": site_origin,
+                                    "source": source_filename
+                                })
+                    except json.JSONDecodeError as e:
+                        print(f"  Error reading JSON metadata for {file_name}: {e}. Skipping.")
+                    except Exception as e:
+                        print(f"  Error processing {file_name}: {e}.")
+
+    if not retrieved_headlines:
+        print(f"{ANSI_BLUE}No headlines found matching your criteria.{ANSI_RESET}")
+    else:
+        print("\n--- Retrieved Headlines (Direct from File System) ---")
+        for i, item in enumerate(retrieved_headlines):
+            print(f"{i+1}. {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}{item['title']}{ANSI_RESET}")
+            print(f"   {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}{item['summary']}{ANSI_RESET}")
+            print(f"   (Source: {item['source']}, Site: {item['site_origin']})")
+            print("-" * 20)
+        print("--- END HEADLINES ---")
+
+
+# --- Renamed and Updated Summary Handler Function ---
+
+def handle_summary_query(llm, summary_vectorstore, original_query_text, query_text_for_llm, metadata_filter, HEADLINE_SUMMARIZER_PROMPT, SYSTEM_INSTRUCTION_PROMPT, kb_name_for_print="Summaries"):
+    """
+    Handles queries specifically for summaries (news, blog, social media).
+    This function uses ChromaDB and the LLM for semantic search and synthesis.
+    """
+    print(f"Searching and generating high-level overview from '{kb_name_for_print.upper()}' knowledge base (streaming)...")
+    
+    if summary_vectorstore:
+        embeddings_model = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+        
+        chroma_client_collection = summary_vectorstore._collection
+
+        chroma_where_clause = {}
         if metadata_filter:
-            print(f"  Applying metadata filter: {metadata_filter}")
-            retriever = news_summaries_vectorstore.as_retriever(filter=metadata_filter, search_kwargs={"k": 50}) # Can adjust k here
-        else:
-            retriever = news_summaries_vectorstore.as_retriever(search_kwargs={"k": 50}) # Can adjust k here
-        
-        retrieved_docs_raw = retriever.get_relevant_documents(query_text_for_llm)
-        
+            conditions = []
+            for k, v in metadata_filter.items():
+                if k == "publication_date" and isinstance(v, dict):
+                    # For publication_date, break it into two separate $gte and $lte conditions
+                    if "$gte" in v:
+                        conditions.append({"publication_date": {"$gte": v["$gte"]}})
+                    if "$lte" in v:
+                        conditions.append({"publication_date": {"$lte": v["$lte"]}})
+                else:
+                    # For other simple key-value pairs or other operators, add directly
+                    conditions.append({k: v})
+            
+            if len(conditions) == 1:
+                chroma_where_clause = conditions[0]
+            elif len(conditions) > 1:
+                chroma_where_clause = {"$and": conditions}
+            # If conditions is empty, chroma_where_clause remains {}, which is correct for no filter
+
+        print(f"  DEBUG: Initial metadata_filter: {metadata_filter}")
+        print(f"  DEBUG: Constructed chroma_where_clause: {chroma_where_clause}")
+
+        retrieved_docs_raw = []
+        try:
+            final_query_text_for_embedding = query_text_for_llm if query_text_for_llm.strip() else "general news summaries and headlines"
+            
+            query_embedding = embeddings_model.embed_query(final_query_text_for_embedding)
+            
+            print(f"  Using ChromaDB .query() for semantic search with filters (if any). Query embedding based on: '{final_query_text_for_embedding}'")
+            
+            results = chroma_client_collection.query(
+                query_embeddings=[query_embedding],
+                n_results=100, # Retrieve a large number to ensure filter covers all matches
+                where=chroma_where_clause, # Apply the correctly formatted filter
+                include=['documents', 'metadatas', 'distances']
+            )
+
+            if results['documents']:
+                for i in range(len(results['documents'])):
+                    doc_content = results['documents'][i][0]
+                    doc_metadata = results['metadatas'][i][0]
+                    retrieved_docs_raw.append(LcDocument(page_content=doc_content, metadata=doc_metadata))
+            
+            if not retrieved_docs_raw and metadata_filter:
+                raise ValueError(f"ChromaDB .query() returned no results after applying filter {metadata_filter}. This means no documents match these criteria.")
+            elif not retrieved_docs_raw:
+                raise ValueError("ChromaDB .query() returned no results for semantic search (without explicit filters).")
+
+        except Exception as e:
+            print(f"Error during ChromaDB retrieval with .query(): {e}. This might mean no results matching criteria were found or an unexpected error occurred. No fallback to LangChain retriever in this case as it won't magically find documents not indexed.")
+            retrieved_docs_raw = []
+
         # Deduplicate retrieved summaries based on file_path (most reliable)
         unique_docs_map = {}
         for doc in retrieved_docs_raw:
             doc_key = doc.metadata.get("file_path") 
             if doc_key and doc_key not in unique_docs_map: 
                 unique_docs_map[doc_key] = doc
+            elif not doc_key: 
+                content_key = f"{doc.metadata.get('original_title', '')}_{doc.page_content[:50]}"
+                if content_key not in unique_docs_map:
+                    unique_docs_map[content_key] = doc
+
         retrieved_docs = list(unique_docs_map.values())
         print(f"  Retrieved {len(retrieved_docs_raw)} raw summaries, kept {len(retrieved_docs)} unique summaries.")
 
         if not retrieved_docs:
-            print(f"{ANSI_BLUE}No relevant news summaries found in the '{NEWS_SUMMARIES_KB_NAME}' knowledge base for your query.{ANSI_RESET}") 
+            print(f"{ANSI_BLUE}No relevant summaries found in the '{kb_name_for_print}' knowledge base for your query.{ANSI_RESET}") 
             user_query_content = f"Question: {original_query_text}\nAnswer:"
             messages_for_llm = [
                 {"role": "system", "content": SYSTEM_INSTRUCTION_PROMPT},
@@ -589,6 +753,18 @@ def handle_news_summary_query(llm, news_summaries_vectorstore, original_query_te
             ]
         else:
             headline_context_parts = []
+            print("\n--- DEBUG: Details of Retrieved Documents (from handle_summary_query, after filter) ---")
+            for i, doc in enumerate(retrieved_docs):
+                print(f"  Document {i+1}:")
+                print(f"    Chroma Doc ID: {doc.metadata.get('id', 'N/A')}") 
+                print(f"    File Path: {doc.metadata.get('file_path', 'N/A')}")
+                print(f"    Site Origin (from metadata): {doc.metadata.get('site_origin', 'N/A')}")
+                print(f"    Original Title (from metadata): {doc.metadata.get('original_title', 'N/A')}")
+                print(f"    Full Article Summary (page_content):\n{doc.page_content}\n")
+                print(f"    All Metadata: {doc.metadata}")
+                print("-" * 20)
+            print("--- END DEBUG ---\n")
+            
             for doc in retrieved_docs:
                 title = doc.metadata.get("original_title", "No Title")
                 summary = doc.page_content 
@@ -603,10 +779,9 @@ def handle_news_summary_query(llm, news_summaries_vectorstore, original_query_te
                 {"role": "user", "content": user_query_content}
             ]
     else:
-        print(f"{ANSI_BLUE}News summaries knowledge base not loaded. Cannot provide headline overview.{ANSI_RESET}") 
-        return # Exit the handler if KB is not available
+        print(f"{ANSI_BLUE}{kb_name_for_print} knowledge base not loaded. Cannot provide overview.{ANSI_RESET}") 
+        return
 
-    # Print streaming response
     print("\n--- Answer (Streaming) ---")
     print(ANSI_BLUE, end="", flush=True) 
     full_response_content = ""
@@ -674,7 +849,6 @@ Answer:"""
             {"role": "user", "content": user_query_content}
         ]
 
-    # Print streaming response
     print("\n--- Answer (Streaming) ---")
     print(ANSI_BLUE, end="", flush=True) 
     full_response_content = ""
@@ -684,6 +858,44 @@ Answer:"""
             full_response_content += chunk.content
     print(ANSI_RESET) 
     print("\n")
+
+# New debug function to inspect ChromaDB content directly
+def debug_chroma_content(vectorstore, filter_site_origin):
+    """
+    Directly queries a ChromaDB vectorstore with a site_origin filter
+    and prints the details of the retrieved documents.
+    """
+    if not vectorstore:
+        print(f"Debug: Vectorstore is not initialized. Cannot debug content for {filter_site_origin}.")
+        return
+
+    print(f"\n--- DEBUG: Directly Querying ChromaDB for site_origin: {filter_site_origin} ---")
+    
+    try:
+        chroma_client_collection = vectorstore._collection
+
+        results = chroma_client_collection.get(
+            where={"site_origin": filter_site_origin},
+            limit=100 
+        )
+
+        if not results['ids']:
+            print(f"  No documents found in ChromaDB with site_origin '{filter_site_origin}'.")
+        else:
+            print(f"  Found {len(results['ids'])} documents matching site_origin '{filter_site_origin}':")
+            for i in range(len(results['ids'])):
+                doc_id = results['ids'][i]
+                metadata = results['metadatas'][i]
+                document_content = results['documents'][i] 
+
+                print(f"  Document {i+1} (Chroma Internal ID: {doc_id}):")
+                print(f"    Metadata: {metadata}")
+                print(f"    Content (full):\n{document_content}\n") # Print full content for debug
+                print("-" * 20)
+    except Exception as e:
+        print(f"  Error during direct ChromaDB debug query: {e}")
+
+    print("--- END DIRECT CHROMA DEBUG ---\n")
 
 
 def main():
@@ -695,73 +907,88 @@ def main():
     llamafile_process, llama_startup_error = start_llamafile_server()
     if llama_startup_error:
         print(f"Fatal error during Llamafile server startup: {llama_startup_error}")
-        return # Exit if llamafile fails to start or connect
+        return
 
-    # Ensure all specialized data directories exist
     BASE_DATA_DIR.mkdir(exist_ok=True)
-    MISC_DIR.mkdir(exist_ok=True) 
+    MISC_DIR.mkdir(exist_ok=True)
     SEC_DIR.mkdir(exist_ok=True)
     LEGAL_DIR.mkdir(exist_ok=True)
-    NEWS_DIR.mkdir(exist_ok=True) # For raw news articles (text + json)
+    NEWS_DIR.mkdir(exist_ok=True)
+    BLOG_DIR.mkdir(exist_ok=True)
+    SOCIAL_MEDIA_DIR.mkdir(exist_ok=True)
     
-    # Base directory for all vector stores (each will get its own subdirectory)
     BASE_VECTOR_DB_DIR.mkdir(exist_ok=True)
 
-    # Define news summaries KB name
     NEWS_SUMMARIES_KB_NAME = "news_summaries" 
+    BLOG_SUMMARIES_KB_NAME = "blog_summaries"
+    SOCIAL_MEDIA_SUMMARIES_KB_NAME = "social_media_summaries"
 
     print("\n--- Document Organization ---")
     print(f"  Place miscellaneous documents (TXT, DOCX, PDF, generic HTML) in: {MISC_DIR}") 
     print(f"  Place SEC filings (HTML/HTM) in: {SEC_DIR}")
     print(f"  Place legal documents (TXT, DOCX, PDF) in: {LEGAL_DIR}")
     print(f"  Place news articles (TXT, from scraper with JSON metadata including summaries) in: {NEWS_DIR}") 
+    print(f"  NEW: Place blog articles (TXT, with JSON metadata including summaries) in: {BLOG_DIR}")
+    print(f"  NEW: Place social media content (TXT, with JSON metadata including summaries) in: {SOCIAL_MEDIA_DIR}")
     print("-----------------------------\n")
 
-    # Dictionary to hold our separate vector stores
     knowledge_bases = {}
     
-    # Load documents and initialize vector store for misc category
     print(f"Loading documents and initializing vector store for '{MISC_DIR.name}'...")
     misc_docs = load_documents_from_directory(MISC_DIR)
     misc_vectorstore = initialize_vector_store_for_category(misc_docs, MISC_DIR.name)
     if misc_vectorstore:
         knowledge_bases['misc'] = misc_vectorstore
     
-    # Load documents and initialize vector store for SEC category
     print(f"\nLoading documents and initializing vector store for '{SEC_DIR.name}'...")
     sec_docs = load_documents_from_directory(SEC_DIR)
     sec_vectorstore = initialize_vector_store_for_category(sec_docs, SEC_DIR.name)
     if sec_vectorstore:
         knowledge_bases['sec'] = sec_vectorstore
 
-    # Load documents and initialize vector store for Legal category
     print(f"\nLoading documents and initializing vector store for '{LEGAL_DIR.name}'...")
     legal_docs = load_documents_from_directory(LEGAL_DIR)
     legal_vectorstore = initialize_vector_store_for_category(legal_docs, LEGAL_DIR.name)
     if legal_vectorstore:
         knowledge_bases['legal'] = legal_vectorstore
 
-    # Load documents and initialize vector store for News (full articles) category
     print(f"\nLoading documents and initializing vector store for '{NEWS_DIR.name}' (full articles)...")
     news_full_docs = load_documents_from_directory(NEWS_DIR, load_summaries=False)
     news_full_vectorstore = initialize_vector_store_for_category(news_full_docs, NEWS_DIR.name, use_summaries=False)
     if news_full_vectorstore:
-        knowledge_bases['news_full'] = news_full_vectorstore # Renamed key for clarity
+        knowledge_bases['news_full'] = news_full_vectorstore
 
-    # Load documents and initialize vector store for News Summaries category
     print(f"\nLoading documents and initializing vector store for '{NEWS_SUMMARIES_KB_NAME}' (summaries)...")
-    news_summary_docs = load_documents_from_directory(NEWS_DIR, load_summaries=True, summary_kb_name=NEWS_SUMMARIES_KB_NAME) # Pass KB name for category
+    news_summary_docs = load_documents_from_directory(NEWS_DIR, load_summaries=True, summary_kb_name=NEWS_SUMMARIES_KB_NAME) 
     news_summary_vectorstore = initialize_vector_store_for_category(news_summary_docs, NEWS_SUMMARIES_KB_NAME, use_summaries=True)
     if news_summary_vectorstore:
         knowledge_bases[NEWS_SUMMARIES_KB_NAME] = news_summary_vectorstore
 
+    print(f"\nLoading documents and initializing vector store for '{BLOG_SUMMARIES_KB_NAME}' (summaries)...")
+    blog_summary_docs = load_documents_from_directory(BLOG_DIR, load_summaries=True, summary_kb_name=BLOG_SUMMARIES_KB_NAME) 
+    blog_summary_vectorstore = initialize_vector_store_for_category(blog_summary_docs, BLOG_SUMMARIES_KB_NAME, use_summaries=True)
+    if blog_summary_vectorstore:
+        knowledge_bases[BLOG_SUMMARIES_KB_NAME] = blog_summary_vectorstore
+
+    print(f"\nLoading documents and initializing vector store for '{SOCIAL_MEDIA_SUMMARIES_KB_NAME}' (summaries)...")
+    social_media_summary_docs = load_documents_from_directory(SOCIAL_MEDIA_DIR, load_summaries=True, summary_kb_name=SOCIAL_MEDIA_SUMMARIES_KB_NAME) 
+    social_media_summary_vectorstore = initialize_vector_store_for_category(social_media_summary_docs, SOCIAL_MEDIA_SUMMARIES_KB_NAME, use_summaries=True)
+    if social_media_summary_vectorstore:
+        knowledge_bases[SOCIAL_MEDIA_SUMMARIES_KB_NAME] = social_media_summary_vectorstore
+
+
     if not knowledge_bases:
         print("\nNo active knowledge bases found. Please ensure documents are in the correct 'data' subfolders and try again.")
-        if llamafile_process and isinstance(llamafile_process, subprocess.Popen): # Safe termination
+        if llamafile_process and isinstance(llamafile_process, subprocess.Popen):
             llamafile_process.terminate()
         return
 
     print(f"\nSuccessfully loaded {len(knowledge_bases)} knowledge bases: {', '.join(knowledge_bases.keys())}")
+
+    if 'news_summaries' in knowledge_bases:
+        debug_chroma_content(knowledge_bases['news_summaries'], 'cnn.com')
+        debug_chroma_content(knowledge_bases['news_summaries'], 'foxnews.com')
+
 
     print(f"Connecting to LLM via llamafile at {LLAMAFILE_API_BASE}...")
     try:
@@ -778,7 +1005,7 @@ def main():
         print(f"Error connecting to llamafile LLM at {LLAMAFILE_API_BASE}.")
         print(f"Error details: {e}")
         print(f"Please ensure '{LLAMAFILE_NAME}' is running in server mode and reachable at {LLAMAFILE_API_BASE}.")
-        if llamafile_process and isinstance(llamafile_process, subprocess.Popen): # Safe termination
+        if llamafile_process and isinstance(llamafile_process, subprocess.Popen):
             llamafile_process.terminate()
         return
 
@@ -788,8 +1015,9 @@ def main():
         print(f"  - {key.upper()}")
     print("Type 'exit' or 'quit' to end the session.")
     print("To query a specific knowledge base for *detailed* info, type '<CATEGORY>: <your question>'. E.g., 'NEWS_FULL: Tell me about the energy bill.'")
-    print("For a high-level news overview (headlines), just type 'Summarize today's headlines' or 'What's the news from last week?' (no category prefix needed, or use 'NEWS_SUMMARIES:')")
-    print("If no category is specified and it's not a headline query, I will query across **ALL** content-based knowledge bases (MISC, SEC, LEGAL, NEWS_FULL).") 
+    print("For a high-level summary overview (news, blogs, social media), just type 'Summarize today's headlines' or 'Summarize recent blogs' (no category prefix needed, or use 'NEWS_SUMMARIES:', 'BLOG_SUMMARIES:', etc.)")
+    print("If no category is specified and it's not a summary query, I will query across **ALL** content-based knowledge bases (MISC, SEC, LEGAL, NEWS_FULL).") 
+    print(f"To debug ChromaDB content directly, type '{ANSI_YELLOW}debug: <site_origin>'{ANSI_RESET} (e.g., 'debug: foxnews.com').")
     print(f"Press {ANSI_YELLOW}Ctrl+C{ANSI_RESET} to stop a streamed response early.") 
 
     try:
@@ -802,50 +1030,66 @@ def main():
                 print("Please enter a question.")
                 continue
             
-            # --- Handle 'help' command ---
             if user_input.lower() == "help":
                 print("\n--- Help: Available Knowledge Bases & Sample Prompts ---")
                 print(f"Available Knowledge Bases (Categories): {', '.join(kb.upper() for kb in knowledge_bases.keys())}")
                 print("\nSample Prompts:")
-                print(f"{ANSI_YELLOW}General News Overview:{ANSI_RESET}") 
+                print(f"{ANSI_YELLOW}General Summary Overview (News, Blogs, Social Media):{ANSI_RESET}") 
                 print("  - Summarize today's headlines")
                 print("  - What's the news from last week from CNN?")
                 print("  - Give me headlines about politics from yesterday.")
                 print("  - NEWS_SUMMARIES: Recent economic news.")
-                print(f"{ANSI_YELLOW}Detailed News Query (Full Articles):{ANSI_RESET}") 
+                print("  - Summarize recent blogs.")
+                print("  - BLOG_SUMMARIES: What are the latest tech blog posts?")
+                print("  - Summarize social media trends from today.")
+                print("  - SOCIAL_MEDIA_SUMMARIES: What are people saying about stock X?")
+                print(f"{ANSI_YELLOW}Detailed Document Query (Full Content):{ANSI_RESET}") 
                 print("  - NEWS_FULL: What are the details about the latest energy bill?")
                 print("  - NEWS_FULL: Explain the recent market fluctuations from foxnews.com.")
-                print(f"{ANSI_YELLOW}Other Document Categories:{ANSI_RESET}") 
                 print("  - MISC: What is the main topic of the document 'my_research_paper.txt'?")
                 print("  - SEC: Summarize the latest 10-K filing from Apple Inc.")
                 print("  - LEGAL: Explain the concept of 'force majeure' from my legal documents.")
                 print(f"\n{ANSI_YELLOW}Tips:{ANSI_RESET}") 
                 print("  - Use `CATEGORY:` prefix for specific knowledge base queries.")
                 print("  - For dates, you can use 'today', 'yesterday', 'last week', 'this month', 'YYYY-MM-DD', or 'MM-DD-YYYY'.")
-                print("  - For sites, you can use 'cnn.com', 'foxnews.com', 'bbc.com', etc.")
+                print("  - For sites, you can use 'cnn.com', 'foxnews.com', 'reddit.com', 'medium.com', etc.")
                 print("-----------------------------------------------------")
-                continue # Skip the rest of the loop and prompt again
+                continue
 
-            # --- Routing Logic ---
+            if user_input.lower().startswith("debug:"):
+                site_to_debug = user_input[len("debug:"):].strip()
+                if site_to_debug and 'news_summaries' in knowledge_bases:
+                    debug_chroma_content(knowledge_bases['news_summaries'], site_to_debug)
+                else:
+                    print(f"{ANSI_BLUE}Invalid debug command or 'news_summaries' KB not loaded. Usage: debug: <site_origin>{ANSI_RESET}")
+                continue
+
             selected_category, original_query_text, query_text_for_llm, metadata_filter = \
                 parse_user_input(user_input, knowledge_bases.keys())
 
-            if selected_category == 'news_summaries':
-                if NEWS_SUMMARIES_KB_NAME in knowledge_bases:
-                    handle_news_summary_query(llm, knowledge_bases[NEWS_SUMMARIES_KB_NAME], 
-                                              original_query_text, query_text_for_llm, 
-                                              metadata_filter, HEADLINE_SUMMARIZER_PROMPT, 
-                                              SYSTEM_INSTRUCTION_PROMPT)
+            # NEW: Handle 'direct_headlines' category for file system read
+            if selected_category == 'direct_headlines':
+                print(f"Retrieving headlines directly from file system for '{original_query_text}'...")
+                # The get_headlines_from_filesystem function will handle filtering and printing
+                get_headlines_from_filesystem(original_query_text, metadata_filter)
+                continue # Skip the rest of the loop and prompt for next question
+
+            # Existing logic for summary KBs (now only for LLM synthesis)
+            elif selected_category in [NEWS_SUMMARIES_KB_NAME, BLOG_SUMMARIES_KB_NAME, SOCIAL_MEDIA_SUMMARIES_KB_NAME]:
+                if selected_category in knowledge_bases:
+                    handle_summary_query(llm, knowledge_bases[selected_category], 
+                                         original_query_text, query_text_for_llm, 
+                                         metadata_filter, HEADLINE_SUMMARIZER_PROMPT, 
+                                         SYSTEM_INSTRUCTION_PROMPT, selected_category)
                 else:
-                    print(f"{ANSI_BLUE}News summaries knowledge base not loaded. Cannot provide headline overview.{ANSI_RESET}")
+                    print(f"{ANSI_BLUE}{selected_category.replace('_', ' ').title()} knowledge base not loaded. Cannot provide overview.{ANSI_RESET}")
+            # If not a summary query, proceed to general content query logic
             elif selected_category in ['misc', 'sec', 'legal', 'news_full']:
                 handle_general_query(llm, knowledge_bases, original_query_text, 
                                      query_text_for_llm, selected_category, SYSTEM_INSTRUCTION_PROMPT)
-            elif selected_category == 'auto': # Fallback for general queries not caught by headline detection
-                # This means it's not a headline query, and no specific KB was selected.
-                # Query all general content KBs.
+            elif selected_category == 'auto':
                 content_kbs_for_auto_query = [
-                    kb for kb in knowledge_bases if kb not in [NEWS_SUMMARIES_KB_NAME]
+                    kb for kb in knowledge_bases if kb not in [NEWS_SUMMARIES_KB_NAME, BLOG_SUMMARIES_KB_NAME, SOCIAL_MEDIA_SUMMARIES_KB_NAME]
                 ]
                 if content_kbs_for_auto_query:
                     handle_general_query(llm, knowledge_bases, original_query_text, 
@@ -854,7 +1098,6 @@ def main():
                 else:
                     print(f"{ANSI_BLUE}No general content knowledge bases loaded to answer your query.{ANSI_RESET}")
             else:
-                # This block should ideally not be hit with good routing, but for safety:
                 print(f"{ANSI_BLUE}Could not determine query type or find relevant knowledge base for '{user_input}'. Please try 'help' for options.{ANSI_RESET}")
 
     except KeyboardInterrupt:
@@ -863,7 +1106,6 @@ def main():
         print(f"{ANSI_RESET}An error occurred during processing: {e}{ANSI_RESET}") 
         print(f"{ANSI_RESET}Please ensure the llamafile server is still running and try again.{ANSI_RESET}") 
     finally:
-        # Check if llamafile_process is a valid Popen object before trying to terminate
         if llamafile_process and isinstance(llamafile_process, subprocess.Popen):
             print("Terminating llamafile server...")
             llamafile_process.terminate()
@@ -875,6 +1117,4 @@ def main():
             print("Llamafile process was not running or not successfully started by app.py. No process to terminate.")
 
 if __name__ == "__main__":
-    # This block should be minimal, only calling main()
     main()
-
