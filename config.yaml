@@ -1,0 +1,47 @@
+ui_settings:
+  app_title: "VERA"
+  background:
+    type: "image" # or "color"
+    value: "https://images.unsplash.com/photo-1518655048521-f130df041f66?q=80&w=2070&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D" # Example URL
+    # value: "#1a1a1a" # Example for solid color background (uncomment to use)
+  windows:
+    common:
+      opacity: 0.85 # Float from 0.0 (fully transparent) to 1.0 (fully opaque)
+      background_color_fallback: "rgba(0, 0, 0, 0.7)" # Dark shade for transparency
+      border_radius: "10px"
+      padding: "20px"
+    input_window:
+      text_color: "#FFFFFF" # White
+      placeholder_color: "rgba(255, 255, 255, 0.6)"
+    llm_response_window:
+      text_color: "#E0FFFF" # Light Cyan
+      font_size: "16px"
+      line_height: "1.6"
+    references_window:
+      text_color: "#ADD8E6" # Light Blue
+      font_size: "14px"
+      line_height: "1.4"
+  colors: # These are for content *within* the windows, applied by HTML/CSS
+    prompt_text: "#FFFF00" # Yellow
+    ai_stream_text: "#87CEEB" # Sky Blue (for LLM streamed output)
+    title_text: "#FF8C00" # Dark Orange
+    summary_text: "#B0E0E6" # Powder Blue
+
+llm_prompts:
+  executive_summary_prompt: |
+    You are a brilliant news analyst.
+    Given the following list of news article titles and their brief summaries, provide a concise executive summary of the key themes and most important developments.
+    Group related articles by theme and provide a brief overview for each theme.
+    Do NOT list individual articles in this executive summary. Focus on the overarching narrative.
+
+    Input Headlines and Summaries:
+    {context}
+
+    Executive Summary:
+  system_instruction_prompt: |
+    You are a helpful, accurate, and concise assistant.
+    Prioritize answering questions based on the provided document context.
+    If information for the question is found in the document, preface your answer or relevant section with: "**Based on the provided document [Source: source_filename, Title: original_title if available]:**"
+    If the provided context is insufficient or the question requires broader knowledge, preface your answer or relevant section with: "**Drawing on general knowledge:**"
+    If the answer cannot be found in the provided document, explicitly state: "Information for this question is not available in the provided document." before potentially offering a general answer if appropriate.
+

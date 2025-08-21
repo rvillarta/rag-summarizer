@@ -1,0 +1,173 @@
+body {
+    margin: 0;
+    font-family: 'Inter', sans-serif; /* Using Inter font as per instructions */
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    background-color: var(--bg-color-fallback); /* Fallback color */
+    background-image: var(--bg-image-url);
+    background-size: cover;
+    background-position: center;
+    background-attachment: fixed; /* Keeps background fixed when scrolling */
+    color: white; /* Default text color */
+    overflow-y: auto; /* Allow scrolling if content overflows */
+}
+
+.container {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    padding: 20px;
+    width: 90%; /* Responsive width */
+    max-width: 1200px; /* Max width for large screens */
+    margin: 20px auto; /* Center container and add vertical margin */
+    box-sizing: border-box;
+}
+
+h1 {
+    text-align: center;
+    color: white;
+    font-size: 2.5em;
+    margin-bottom: 20px;
+    text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
+}
+
+.status-message {
+    text-align: center;
+    padding: 10px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+    font-weight: bold;
+    color: white;
+    background-color: rgba(0, 0, 0, 0.6); /* Default dark background for status */
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+}
+
+.window {
+    background-color: var(--window-bg-color);
+    border-radius: var(--window-border-radius);
+    padding: var(--window-padding);
+    box-shadow: 0 8px 16px rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(5px); /* Frosted glass effect, if supported */
+    -webkit-backdrop-filter: blur(5px); /* Safari support */
+    border: 1px solid rgba(255, 255, 255, 0.1); /* Subtle border */
+}
+
+.input-window {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+
+#query-input {
+    flex-grow: 1;
+    padding: 12px 15px;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    border-radius: 8px;
+    background-color: rgba(255, 255, 255, 0.1);
+    color: var(--input-text-color);
+    font-size: 1em;
+    outline: none;
+    transition: all 0.3s ease;
+}
+
+#query-input::placeholder {
+    color: var(--input-placeholder-color);
+}
+
+#query-input:focus {
+    border-color: rgba(255, 255, 255, 0.6);
+    box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.2);
+}
+
+button {
+    padding: 12px 25px;
+    background-color: rgba(0, 123, 255, 0.8); /* Blue shade */
+    color: white;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 1em;
+    font-weight: bold;
+    transition: background-color 0.3s ease, transform 0.1s ease;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+}
+
+button:hover {
+    background-color: rgba(0, 123, 255, 1);
+    transform: translateY(-2px);
+}
+
+button:active {
+    transform: translateY(0);
+}
+
+button:disabled {
+    background-color: rgba(100, 100, 100, 0.6);
+    cursor: not-allowed;
+    box-shadow: none;
+}
+
+.output-windows {
+    display: flex;
+    flex-wrap: wrap; /* Allows windows to wrap on smaller screens */
+    gap: 20px;
+}
+
+.llm-response-window, .references-window {
+    flex: 1; /* Distribute space equally */
+    min-width: 300px; /* Minimum width before wrapping */
+    max-height: 60vh; /* Limit height to enable scrolling */
+    overflow-y: auto; /* Enable vertical scrolling */
+    display: flex;
+    flex-direction: column;
+}
+
+.llm-response-window h2, .references-window h2 {
+    color: white;
+    font-size: 1.5em;
+    margin-top: 0;
+    margin-bottom: 15px;
+    text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.5);
+    flex-shrink: 0; /* Prevent heading from shrinking */
+}
+
+#llm-response-output, #references-output {
+    white-space: pre-wrap; /* Preserve whitespace and wrap text */
+    word-wrap: break-word; /* Break long words */
+    color: var(--llm-text-color); /* General LLM text color */
+    font-size: var(--llm-font-size);
+    line-height: var(--llm-line-height);
+    flex-grow: 1; /* Allow content to fill space */
+    margin: 0;
+    padding: 0;
+}
+
+#references-output {
+    color: var(--references-text-color); /* General references text color */
+    font-size: var(--references-font-size);
+    line-height: var(--references-line-height);
+}
+
+#references-output p {
+    margin: 5px 0;
+}
+
+#references-output hr {
+    border: 0;
+    height: 1px;
+    background: rgba(255, 255, 255, 0.2);
+    margin: 10px 0;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+    .output-windows {
+        flex-direction: column; /* Stack windows vertically on small screens */
+    }
+    .llm-response-window, .references-window {
+        max-height: 45vh; /* Adjust height for stacked layout */
+    }
+}
+

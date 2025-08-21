@@ -8,7 +8,6 @@ from langchain_community.document_loaders import TextLoader, PyPDFLoader, Unstru
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter 
-from langchain.chains import RetrievalQA
 from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
 from langchain.docstore.document import Document as LcDocument
@@ -17,15 +16,7 @@ from datetime import datetime, timedelta
 import re 
 import json 
 
-# --- ANSI Color Codes ---
-# Define these as raw escape sequences, not Python variable names for LLM prompt
-ANSI_YELLOW = "\033[1;33m" # Bright Yellow
-ANSI_BLUE = "\033[1;34m"   # Bright Blue
-ANSI_RESET = "\033[0m"    # Reset to default terminal color
-ANSI_ORANGE = "\033[38;5;208m" # Corrected ANSI Orange code
-ANSI_LIGHT_BLUE = "\033[94m"   # Light Blue
-
-# --- Configuration ---
+# --- Configuration (No ANSI colors here, handled by UI) ---
 # Base directory for all your document data
 BASE_DATA_DIR = Path("data")
 
@@ -35,7 +26,7 @@ SEC_DIR = BASE_DATA_DIR / "sec"
 LEGAL_DIR = BASE_DATA_DIR / "legal"
 NEWS_DIR = BASE_DATA_DIR / "news" # Directory for raw news articles (text + json)
 
-# NEW: Directories for blogs and social media content
+# Directories for blogs and social media content
 BLOG_DIR = BASE_DATA_DIR / "blogs" 
 SOCIAL_MEDIA_DIR = BASE_DATA_DIR / "social_media"
 
@@ -46,32 +37,39 @@ LLAMAFILE_NAME = "Mistral-7B-Instruct-v0.3.Q5_K_M.llamafile"
 LLAMAFILE_API_BASE = "http://localhost:8080/v1"
 GPU_OFFLOAD_LAYERS = 999 
 
-# --- Logging Configuration ---
+# Logging for Llamafile server startup
 LLAMAFILE_LOG_FILE = "llamafile_server.log"
 
-# --- LLM Prompts (Defined globally as they are constant) ---
+# Define all summary KB names
+NEWS_SUMMARIES_KB_NAME = "news_summaries" 
+BLOG_SUMMARIES_KB_NAME = "blog_summaries"
+SOCIAL_MEDIA_SUMMARIES_KB_NAME = "social_media_summaries"
 
-# NEW: Headline Summarizer Prompt for direct listing
-# This prompt will now be used ONLY when the LLM is involved in synthesizing summaries.
-# For direct file system reads, the app will format the output directly.
-HEADLINE_SUMMARIZER_PROMPT = f"""You are a helpful assistant.
-Given a list of news article titles and their brief summaries, your task is to present them clearly.
-Do NOT attempt to group them into themes or categories. Simply list each article entry as provided.
-Format each article entry exactly as: "{ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}[Article Title]{ANSI_RESET} {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}[Article Summary]{ANSI_RESET}"
-Make sure to include the ANSI color codes as specified.
+# --- LLM Prompts (Plain text, no ANSI colors, UI will apply them) ---
 
-Actual Input:
-{{context}}
+# Executive Summary Prompt for LLM (used by direct_headlines)
+EXECUTIVE_SUMMARY_PROMPT = """You are a brilliant news analyst.
+Given the following list of news article titles and their brief summaries, provide a concise executive summary of the key themes and most important developments.
+Group related articles by theme and provide a brief overview for each theme.
+Do NOT list individual articles in this executive summary. Focus on the overarching narrative.
 
-Output:"""
+Input Headlines and Summaries:
+{context}
 
-# System Instruction Prompt for general Q&A
+Executive Summary:"""
+
+# System Instruction Prompt for general Q&A and for LLM in handle_summary_query
 SYSTEM_INSTRUCTION_PROMPT = """You are a helpful, accurate, and concise assistant.
 Prioritize answering questions based on the provided document context.
 If information for the question is found in the document, preface your answer or relevant section with: "**Based on the provided document [Source: source_filename, Title: original_title if available]:**"
 If the provided context is insufficient or the question requires broader knowledge, preface your answer or relevant section with: "**Drawing on general knowledge:**"
 If the answer cannot be found in the provided document, explicitly state: "Information for this question is not available in the provided document." before potentially offering a general answer if appropriate."""
 
+
+# --- Global Instances (will be initialized once) ---
+_llm_instance = None
+_knowledge_bases = {}
+_llamafile_process = None # To hold the subprocess object if started by app.py
 
 # --- Helper Functions ---
 
@@ -529,14 +527,14 @@ def parse_user_input(user_input, available_kbs_keys):
             original_query_text = parts[1].strip() 
             query_text_for_llm = original_query_text 
         else:
-            print(f"{ANSI_BLUE}Invalid category '{category_prefix}'. Attempting intelligent routing.{ANSI_RESET}")
+            print(f"Invalid category '{category_prefix}'. Attempting intelligent routing.")
             # selected_category remains 'auto' for intelligent routing/fallback
 
     # Determine if it's a summary request (news, blog, social media) for auto-routing
     is_summary_req_auto_detected = False
     if selected_category == 'auto' and is_headline_query(original_query_text):
         is_summary_req_auto_detected = True
-        # If it's a headline query and no explicit KB was explicitly chosen,
+        # If it's a headline query and no specific KB was explicitly chosen,
         # then route to direct file system retrieval.
         if not any(prefix.lower() + ':' in original_query_text.lower() for prefix in available_kbs_keys):
             selected_category = 'direct_headlines'
@@ -549,7 +547,7 @@ def parse_user_input(user_input, available_kbs_keys):
         else: # It's a headline query, but an explicit KB was given (e.g., NEWS_SUMMARIES:), so route to that KB's summary handler
             if "blog" in original_query_text.lower():
                 selected_category = 'blog_summaries'
-            elif "social media" in original_query.lower() or "trending" in original_query_text.lower():
+            elif "social media" in original_query_text.lower() or "trending" in original_query_text.lower():
                 selected_category = 'social_media_summaries'
             else:
                 selected_category = 'news_summaries'
@@ -614,7 +612,7 @@ def get_headlines_from_filesystem(original_query_text, metadata_filter):
                                     doc_value = metadata[filter_key]
                                     
                                     if filter_key == "publication_date":
-                                        # Parse doc_value (e.g., "2025-08-20_14-40-25") into datetime object
+                                        # Parse doc_value (e.g., "2025-08-20_14-40:25") into datetime object
                                         try:
                                             # Corrected parsing format for publication_date from JSON
                                             doc_datetime = datetime.strptime(doc_value, "%Y-%m-%d_%H-%M-%S")
@@ -736,12 +734,13 @@ def handle_summary_query(llm, summary_vectorstore, original_query_text, query_te
         print(f"  Retrieved {len(retrieved_docs_raw)} raw summaries, kept {len(retrieved_docs)} unique summaries.")
 
         if not retrieved_docs:
-            print(f"{ANSI_BLUE}No relevant summaries found in the '{kb_name_for_print}' knowledge base for your query.{ANSI_RESET}") 
             user_query_content = f"Question: {original_query_text}\nAnswer:"
             messages_for_llm = [
                 {"role": "system", "content": SYSTEM_INSTRUCTION_PROMPT},
                 {"role": "user", "content": user_query_content}
             ]
+            # Return empty string and empty list if no results, to indicate no LLM response from docs
+            return "No relevant summaries found in the '{kb_name_for_print}' knowledge base for your query.", []
         else:
             headline_context_parts = []
             print("\n--- DEBUG: Details of Retrieved Documents (from handle_summary_query, after filter) ---")
@@ -759,9 +758,9 @@ def handle_summary_query(llm, summary_vectorstore, original_query_text, query_te
             for doc in retrieved_docs:
                 title = doc.metadata.get("original_title", "No Title")
                 summary = doc.page_content 
-                source_info = doc.metadata.get("source", "Unknown Source")
+                source_info = doc.metadata.get("source", "Unknown Site")
                 site_origin = doc.metadata.get("site_origin", "Unknown Site")
-                headline_context_parts.append(f"- Source: {source_info}, Site: {site_origin}, {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}{title}{ANSI_RESET}, {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}{summary}{ANSI_RESET}")
+                headline_context_parts.append(f"- Source: {source_info}, Site: {site_origin}, Title: {title}, Summary: {summary}")
             
             context_str = "\n".join(headline_context_parts)
             user_query_content = HEADLINE_SUMMARIZER_PROMPT.format(context=context_str)
@@ -769,19 +768,17 @@ def handle_summary_query(llm, summary_vectorstore, original_query_text, query_te
                 {"role": "system", "content": SYSTEM_INSTRUCTION_PROMPT},
                 {"role": "user", "content": user_query_content}
             ]
+            
+            # Stream LLM response
+            llm_response_content = ""
+            for chunk in llm.stream(messages_for_llm):
+                if chunk.content:
+                    llm_response_content += chunk.content
+            
+            # Return LLM response and retrieved docs for UI to display
+            return llm_response_content, retrieved_docs
     else:
-        print(f"{ANSI_BLUE}{kb_name_for_print} knowledge base not loaded. Cannot provide overview.{ANSI_RESET}") 
-        return
-
-    print("\n--- Answer (Streaming) ---")
-    print(ANSI_BLUE, end="", flush=True) 
-    full_response_content = ""
-    for chunk in llm.stream(messages_for_llm):
-        if chunk.content:
-            print(chunk.content, end="", flush=True)
-            full_response_content += chunk.content
-    print(ANSI_RESET) 
-    print("\n")
+        return f"Error: {kb_name_for_print} knowledge base not loaded. Cannot provide overview.", []
 
 def handle_general_query(llm, knowledge_bases_dict, original_query_text, query_text_for_llm, target_kb_names, SYSTEM_INSTRUCTION_PROMPT):
     """
@@ -798,9 +795,9 @@ def handle_general_query(llm, knowledge_bases_dict, original_query_text, query_t
             retriever = current_vectorstore.as_retriever()
             retrieved_docs.extend(retriever.get_relevant_documents(query_text_for_llm))
         else:
-            print(f"{ANSI_BLUE}Knowledge base '{kb_name}' not loaded. Skipping search.{ANSI_RESET}")
+            print(f"Knowledge base '{kb_name}' not loaded. Skipping search.")
     elif isinstance(target_kb_names, list): # Multiple KBs (e.g., for 'all' or 'auto' fallback)
-        print(f"Searching across {ANSI_BLUE}multiple knowledge bases:{', '.join(kb.upper() for kb in target_kb_names)}{ANSI_RESET} (streaming)...")
+        print(f"Searching across multiple knowledge bases:{', '.join(kb.upper() for kb in target_kb_names)} (streaming)...")
         for kb_name in target_kb_names:
             current_vectorstore = knowledge_bases_dict.get(kb_name)
             if current_vectorstore:
@@ -808,16 +805,17 @@ def handle_general_query(llm, knowledge_bases_dict, original_query_text, query_t
                 retriever = current_vectorstore.as_retriever()
                 retrieved_docs.extend(retriever.get_relevant_documents(query_text_for_llm))
             else:
-                print(f"  {ANSI_BLUE}Knowledge base '{kb_name}' not loaded. Skipping.{ANSI_RESET}")
+                print(f"  Knowledge base '{kb_name}' not loaded. Skipping.")
 
     if not retrieved_docs:
-        print(f"{ANSI_BLUE}No relevant documents found in the selected knowledge base(s) for your query.{ANSI_RESET}") 
-        context_str = "" # Explicitly empty context for LLM to use general knowledge
-        user_query_content = f"Question: {original_query_text}\nAnswer:"
+        llm_response_content = "No relevant documents found in the selected knowledge base(s) for your query."
+        # If no documents are found, LLM can still draw on general knowledge
         messages_for_llm = [
             {"role": "system", "content": SYSTEM_INSTRUCTION_PROMPT},
-            {"role": "user", "content": user_query_content}
+            {"role": "user", "content": f"Question: {original_query_text}\nAnswer:"}
         ]
+        llm_response_content += "\n" + "".join([chunk.content for chunk in llm.stream(messages_for_llm)])
+        return llm_response_content, []
     else:
         context_parts = []
         for doc in retrieved_docs:
@@ -840,15 +838,12 @@ Answer:"""
             {"role": "user", "content": user_query_content}
         ]
 
-    print("\n--- Answer (Streaming) ---")
-    print(ANSI_BLUE, end="", flush=True) 
-    full_response_content = ""
-    for chunk in llm.stream(messages_for_llm):
-        if chunk.content:
-            print(chunk.content, end="", flush=True)
-            full_response_content += chunk.content
-    print(ANSI_RESET) 
-    print("\n")
+        llm_response_content = ""
+        for chunk in llm.stream(messages_for_llm):
+            if chunk.content:
+                llm_response_content += chunk.content
+        
+        return llm_response_content, retrieved_docs
 
 # New debug function to inspect ChromaDB content directly
 def debug_chroma_content(vectorstore, filter_site_origin):
@@ -858,10 +853,9 @@ def debug_chroma_content(vectorstore, filter_site_origin):
     """
     if not vectorstore:
         print(f"Debug: Vectorstore is not initialized. Cannot debug content for {filter_site_origin}.")
-        return
+        return [] # Return empty list if not initialized
 
-    print(f"\n--- DEBUG: Directly Querying ChromaDB for site_origin: {filter_site_origin} ---")
-    
+    debug_docs = []
     try:
         chroma_client_collection = vectorstore._collection
 
@@ -883,23 +877,40 @@ def debug_chroma_content(vectorstore, filter_site_origin):
                 print(f"    Metadata: {metadata}")
                 print(f"    Content (full):\n{document_content}\n") # Print full content for debug
                 print("-" * 20)
+                debug_docs.append(LcDocument(page_content=document_content, metadata=metadata))
     except Exception as e:
         print(f"  Error during direct ChromaDB debug query: {e}")
 
     print("--- END DIRECT CHROMA DEBUG ---\n")
+    return debug_docs
 
 
-def main():
+def initialize_rag_system(ui_config):
     """
-    Main function to run the RAG application.
+    Initializes the RAG system components: Llamafile server, LLM, and knowledge bases.
+    Accepts ui_config to load prompts.
+    Returns (llm_instance, knowledge_bases, llamafile_process).
     """
-    print("✨ Starting Offline RAG Summarizer (Llamafile Version) ✨")
+    global _llm_instance, _knowledge_bases, _llamafile_process, EXECUTIVE_SUMMARY_PROMPT, SYSTEM_INSTRUCTION_PROMPT # Declare globals here
 
-    llamafile_process, llama_startup_error = start_llamafile_server()
+    print("[app.py] Initializing RAG system (this may take a moment)...")
+
+    # Load prompts from ui_config
+    if 'llm_prompts' in ui_config:
+        EXECUTIVE_SUMMARY_PROMPT = ui_config['llm_prompts'].get('executive_summary_prompt', EXECUTIVE_SUMMARY_PROMPT)
+        SYSTEM_INSTRUCTION_PROMPT = ui_config['llm_prompts'].get('system_instruction_prompt', SYSTEM_INSTRUCTION_PROMPT)
+        print("[app.py] LLM prompts loaded from config.yaml.")
+    else:
+        print("[app.py] Warning: 'llm_prompts' section not found in config.yaml. Using default hardcoded prompts.")
+
+
+    # Start Llamafile server
+    _llamafile_process, llama_startup_error = start_llamafile_server()
     if llama_startup_error:
-        print(f"Fatal error during Llamafile server startup: {llama_startup_error}")
-        return
+        print(f"[app.py] Fatal error during Llamafile server startup: {llama_startup_error}")
+        return None, None, None
 
+    # Ensure all specialized data directories exist
     BASE_DATA_DIR.mkdir(exist_ok=True)
     MISC_DIR.mkdir(exist_ok=True)
     SEC_DIR.mkdir(exist_ok=True)
@@ -907,12 +918,7 @@ def main():
     NEWS_DIR.mkdir(exist_ok=True)
     BLOG_DIR.mkdir(exist_ok=True)
     SOCIAL_MEDIA_DIR.mkdir(exist_ok=True)
-    
     BASE_VECTOR_DB_DIR.mkdir(exist_ok=True)
-
-    NEWS_SUMMARIES_KB_NAME = "news_summaries" 
-    BLOG_SUMMARIES_KB_NAME = "blog_summaries"
-    SOCIAL_MEDIA_SUMMARIES_KB_NAME = "social_media_summaries"
 
     print("\n--- Document Organization ---")
     print(f"  Place miscellaneous documents (TXT, DOCX, PDF, generic HTML) in: {MISC_DIR}") 
@@ -923,67 +929,62 @@ def main():
     print(f"  NEW: Place social media content (TXT, with JSON metadata including summaries) in: {SOCIAL_MEDIA_DIR}")
     print("-----------------------------\n")
 
-    knowledge_bases = {}
-    
+    # Load knowledge bases
     print(f"Loading documents and initializing vector store for '{MISC_DIR.name}'...")
     misc_docs = load_documents_from_directory(MISC_DIR)
     misc_vectorstore = initialize_vector_store_for_category(misc_docs, MISC_DIR.name)
     if misc_vectorstore:
-        knowledge_bases['misc'] = misc_vectorstore
+        _knowledge_bases['misc'] = misc_vectorstore
     
     print(f"\nLoading documents and initializing vector store for '{SEC_DIR.name}'...")
     sec_docs = load_documents_from_directory(SEC_DIR)
     sec_vectorstore = initialize_vector_store_for_category(sec_docs, SEC_DIR.name)
     if sec_vectorstore:
-        knowledge_bases['sec'] = sec_vectorstore
+        _knowledge_bases['sec'] = sec_vectorstore
 
     print(f"\nLoading documents and initializing vector store for '{LEGAL_DIR.name}'...")
     legal_docs = load_documents_from_directory(LEGAL_DIR)
     legal_vectorstore = initialize_vector_store_for_category(legal_docs, LEGAL_DIR.name)
     if legal_vectorstore:
-        knowledge_bases['legal'] = legal_vectorstore
+        _knowledge_bases['legal'] = legal_vectorstore
 
     print(f"\nLoading documents and initializing vector store for '{NEWS_DIR.name}' (full articles)...")
     news_full_docs = load_documents_from_directory(NEWS_DIR, load_summaries=False)
     news_full_vectorstore = initialize_vector_store_for_category(news_full_docs, NEWS_DIR.name, use_summaries=False)
     if news_full_vectorstore:
-        knowledge_bases['news_full'] = news_full_vectorstore
+        _knowledge_bases['news_full'] = news_full_vectorstore
 
     print(f"\nLoading documents and initializing vector store for '{NEWS_SUMMARIES_KB_NAME}' (summaries)...")
     news_summary_docs = load_documents_from_directory(NEWS_DIR, load_summaries=True, summary_kb_name=NEWS_SUMMARIES_KB_NAME) 
     news_summary_vectorstore = initialize_vector_store_for_category(news_summary_docs, NEWS_SUMMARIES_KB_NAME, use_summaries=True)
     if news_summary_vectorstore:
-        knowledge_bases[NEWS_SUMMARIES_KB_NAME] = news_summary_vectorstore
+        _knowledge_bases[NEWS_SUMMARIES_KB_NAME] = news_summary_vectorstore
 
     print(f"\nLoading documents and initializing vector store for '{BLOG_SUMMARIES_KB_NAME}' (summaries)...")
     blog_summary_docs = load_documents_from_directory(BLOG_DIR, load_summaries=True, summary_kb_name=BLOG_SUMMARIES_KB_NAME) 
     blog_summary_vectorstore = initialize_vector_store_for_category(blog_summary_docs, BLOG_SUMMARIES_KB_NAME, use_summaries=True)
     if blog_summary_vectorstore:
-        knowledge_bases[BLOG_SUMMARIES_KB_NAME] = blog_summary_vectorstore
+        _knowledge_bases[BLOG_SUMMARIES_KB_NAME] = blog_summary_vectorstore
 
     print(f"\nLoading documents and initializing vector store for '{SOCIAL_MEDIA_SUMMARIES_KB_NAME}' (summaries)...")
     social_media_summary_docs = load_documents_from_directory(SOCIAL_MEDIA_DIR, load_summaries=True, summary_kb_name=SOCIAL_MEDIA_SUMMARIES_KB_NAME) 
     social_media_summary_vectorstore = initialize_vector_store_for_category(social_media_summary_docs, SOCIAL_MEDIA_SUMMARIES_KB_NAME, use_summaries=True)
     if social_media_summary_vectorstore:
-        knowledge_bases[SOCIAL_MEDIA_SUMMARIES_KB_NAME] = social_media_summary_vectorstore
+        _knowledge_bases[SOCIAL_MEDIA_SUMMARIES_KB_NAME] = social_media_summary_vectorstore
 
 
-    if not knowledge_bases:
+    if not _knowledge_bases:
         print("\nNo active knowledge bases found. Please ensure documents are in the correct 'data' subfolders and try again.")
-        if llamafile_process and isinstance(llamafile_process, subprocess.Popen):
-            llamafile_process.terminate()
-        return
+        if _llamafile_process and isinstance(_llamafile_process, subprocess.Popen):
+            _llamafile_process.terminate()
+        return None, None, None
 
-    print(f"\nSuccessfully loaded {len(knowledge_bases)} knowledge bases: {', '.join(knowledge_bases.keys())}")
+    print(f"\nSuccessfully loaded {len(_knowledge_bases)} knowledge bases: {', '.join(_knowledge_bases.keys())}")
 
-    if 'news_summaries' in knowledge_bases:
-        debug_chroma_content(knowledge_bases['news_summaries'], 'cnn.com')
-        debug_chroma_content(knowledge_bases['news_summaries'], 'foxnews.com')
-
-
+    # Initialize LLM
     print(f"Connecting to LLM via llamafile at {LLAMAFILE_API_BASE}...")
     try:
-        llm = ChatOpenAI(
+        _llm_instance = ChatOpenAI(
             model_name="llamafile",
             openai_api_key="sk-no-key-required",
             openai_api_base=LLAMAFILE_API_BASE,
@@ -991,168 +992,40 @@ def main():
             streaming=True,
             request_timeout=120.0
         )
+        _llm_instance.invoke("Hello", max_tokens=10) # Test connection
         print("LLM (via llamafile) initialized successfully!")
     except Exception as e:
         print(f"Error connecting to llamafile LLM at {LLAMAFILE_API_BASE}.")
         print(f"Error details: {e}")
         print(f"Please ensure '{LLAMAFILE_NAME}' is running in server mode and reachable at {LLAMAFILE_API_BASE}.")
-        if llamafile_process and isinstance(llamafile_process, subprocess.Popen):
-            llamafile_process.terminate()
-        return
+        if _llamafile_process and isinstance(_llamafile_process, subprocess.Popen):
+            _llamafile_process.terminate()
+        return None, None, None
+    
+    return _llm_instance, _knowledge_bases, _llamafile_process
 
-    print("\nReady to answer questions about your documents!")
-    print("Available knowledge bases:")
-    for key in knowledge_bases.keys():
-        print(f"  - {key.upper()}")
-    print("Type 'exit' or 'quit' to end the session.")
-    print("To query a specific knowledge base for *detailed* info, type '<CATEGORY>: <your question>'. E.g., 'NEWS_FULL: Tell me about the energy bill.'")
-    print("For a high-level summary overview (news, blogs, social media), just type 'Summarize today's headlines' or 'Summarize recent blogs' (no category prefix needed, or use 'NEWS_SUMMARIES:', 'BLOG_SUMMARIES:', etc.)")
-    print("If no category is specified and it's not a summary query, I will query across **ALL** content-based knowledge bases (MISC, SEC, LEGAL, NEWS_FULL).") 
-    print(f"To debug ChromaDB content directly, type '{ANSI_YELLOW}debug: <site_origin>'{ANSI_RESET} (e.g., 'debug: foxnews.com').")
-    print(f"Press {ANSI_YELLOW}Ctrl+C{ANSI_RESET} to stop a streamed response early.") 
+# --- Debug print for module loading ---
+print(f"[app.py] Module loaded. initialize_rag_system is defined: {'initialize_rag_system' in globals()}")
 
-    try:
-        while True:
-            user_input = input(f"\n{ANSI_YELLOW}Your question (e.g., NEWS: Summarize politics): {ANSI_RESET}").strip() 
-            if user_input.lower() in ["exit", "quit"]:
-                print("Exiting RAG Summarizer. Goodbye!")
-                break
-            if not user_input:
-                print("Please enter a question.")
-                continue
-            
-            if user_input.lower() == "help":
-                print("\n--- Help: Available Knowledge Bases & Sample Prompts ---")
-                print(f"Available Knowledge Bases (Categories): {', '.join(kb.upper() for kb in knowledge_bases.keys())}")
-                print("\nSample Prompts:")
-                print(f"{ANSI_YELLOW}General Summary Overview (News, Blogs, Social Media):{ANSI_RESET}") 
-                print("  - Summarize today's headlines")
-                print("  - What's the news from last week from CNN?")
-                print("  - Give me headlines about politics from yesterday.")
-                print("  - NEWS_SUMMARIES: Recent economic news.")
-                print("  - Summarize recent blogs.")
-                print("  - BLOG_SUMMARIES: What are the latest tech blog posts?")
-                print("  - Summarize social media trends from today.")
-                print("  - SOCIAL_MEDIA_SUMMARIES: What are people saying about stock X?")
-                print(f"{ANSI_YELLOW}Detailed Document Query (Full Content):{ANSI_RESET}") 
-                print("  - NEWS_FULL: What are the details about the latest energy bill?")
-                print("  - NEWS_FULL: Explain the recent market fluctuations from foxnews.com.")
-                print("  - MISC: What is the main topic of the document 'my_research_paper.txt'?")
-                print("  - SEC: Summarize the latest 10-K filing from Apple Inc.")
-                print("  - LEGAL: Explain the concept of 'force majeure' from my legal documents.")
-                print(f"\n{ANSI_YELLOW}Tips:{ANSI_RESET}") 
-                print("  - Use `CATEGORY:` prefix for specific knowledge base queries.")
-                print("  - For dates, you can use 'today', 'yesterday', 'last week', 'this month', 'YYYY-MM-DD', or 'MM-DD-YYYY'.")
-                print("  - For sites, you can use 'cnn.com', 'foxnews.com', 'reddit.com', 'medium.com', etc.")
-                print("-----------------------------------------------------")
-                continue
-
-            if user_input.lower().startswith("debug:"):
-                site_to_debug = user_input[len("debug:"):].strip()
-                if site_to_debug and 'news_summaries' in knowledge_bases:
-                    debug_chroma_content(knowledge_bases['news_summaries'], site_to_debug)
-                else:
-                    print(f"{ANSI_BLUE}Invalid debug command or 'news_summaries' KB not loaded. Usage: debug: <site_origin>{ANSI_RESET}")
-                continue
-
-            selected_category, original_query_text, query_text_for_llm, metadata_filter = \
-                parse_user_input(user_input, knowledge_bases.keys())
-
-            # NEW: Handle 'direct_headlines' category for file system read
-            if selected_category == 'direct_headlines':
-                print(f"Retrieving headlines directly from file system for '{original_query_text}'...")
-                # The get_headlines_from_filesystem function will handle filtering and returning data
-                retrieved_headlines_list = get_headlines_from_filesystem(original_query_text, metadata_filter)
-                
-                if not retrieved_headlines_list:
-                    print(f"{ANSI_BLUE}No headlines found matching your criteria from the file system.{ANSI_RESET}")
-                else:
-                    # Format the retrieved headlines for the LLM's context
-                    llm_context_for_executive_summary = []
-                    for item in retrieved_headlines_list:
-                        llm_context_for_executive_summary.append(
-                            f"- Source: {item['source']}, Site: {item['site_origin']}, Title: {item['title']}, Summary: {item['summary']}"
-                        )
-                    context_str_for_llm = "\n".join(llm_context_for_executive_summary)
-
-                    # Prepare messages for LLM to generate the executive summary
-                    executive_summary_prompt = f"""You are a brilliant news analyst.
-Given the following list of news article titles and their brief summaries, provide a concise executive summary of the key themes and most important developments.
-Group related articles by theme and provide a brief overview for each theme.
-Do NOT list individual articles in this executive summary. Focus on the overarching narrative.
-
-Input Headlines and Summaries:
-{context_str_for_llm}
-
-Executive Summary:"""
-                    
-                    messages_for_llm = [
-                        {"role": "system", "content": SYSTEM_INSTRUCTION_PROMPT},
-                        {"role": "user", "content": executive_summary_prompt}
-                    ]
-
-                    # Print the LLM's executive summary first
-                    print("\n--- Executive News Briefing ---")
-                    print(ANSI_BLUE, end="", flush=True)
-                    for chunk in llm.stream(messages_for_llm):
-                        if chunk.content:
-                            print(chunk.content, end="", flush=True)
-                    print(ANSI_RESET)
-                    print("\n--- End Executive Briefing ---\n")
-
-                    # Then, print the original list of headlines
-                    print("\n--- Retrieved Headlines (Direct from File System) ---")
-                    for i, item in enumerate(retrieved_headlines_list):
-                        print(f"{i+1}. {ANSI_YELLOW}Title:{ANSI_RESET} {ANSI_ORANGE}{item['title']}{ANSI_RESET}")
-                        print(f"   {ANSI_YELLOW}Summary:{ANSI_RESET} {ANSI_LIGHT_BLUE}{item['summary']}{ANSI_RESET}")
-                        print(f"   (Source: {item['source']}, Site: {item['site_origin']})")
-                        print("-" * 20)
-                    print("--- END HEADLINES ---")
-                
-                continue # Skip the rest of the loop and prompt for next question
-
-            # Existing logic for summary KBs (now only for LLM synthesis)
-            elif selected_category in [NEWS_SUMMARIES_KB_NAME, BLOG_SUMMARIES_KB_NAME, SOCIAL_MEDIA_SUMMARIES_KB_NAME]:
-                if selected_category in knowledge_bases:
-                    handle_summary_query(llm, knowledge_bases[selected_category], 
-                                         original_query_text, query_text_for_llm, 
-                                         metadata_filter, HEADLINE_SUMMARIZER_PROMPT, 
-                                         SYSTEM_INSTRUCTION_PROMPT, selected_category)
-                else:
-                    print(f"{ANSI_BLUE}{selected_category.replace('_', ' ').title()} knowledge base not loaded. Cannot provide overview.{ANSI_RESET}")
-            # If not a summary query, proceed to general content query logic
-            elif selected_category in ['misc', 'sec', 'legal', 'news_full']:
-                handle_general_query(llm, knowledge_bases, original_query_text, 
-                                     query_text_for_llm, selected_category, SYSTEM_INSTRUCTION_PROMPT)
-            elif selected_category == 'auto':
-                content_kbs_for_auto_query = [
-                    kb for kb in knowledge_bases if kb not in [NEWS_SUMMARIES_KB_NAME, BLOG_SUMMARIES_KB_NAME, SOCIAL_MEDIA_SUMMARIES_KB_NAME]
-                ]
-                if content_kbs_for_auto_query:
-                    handle_general_query(llm, knowledge_bases, original_query_text, 
-                                         query_text_for_llm, content_kbs_for_auto_query, 
-                                         SYSTEM_INSTRUCTION_PROMPT)
-                else:
-                    print(f"{ANSI_BLUE}No general content knowledge bases loaded to answer your query.{ANSI_RESET}")
-            else:
-                print(f"{ANSI_BLUE}Could not determine query type or find relevant knowledge base for '{user_input}'. Please try 'help' for options.{ANSI_RESET}")
-
-    except KeyboardInterrupt:
-        print(f"{ANSI_RESET}\nResponse generation stopped by user.{ANSI_RESET}") 
-    except Exception as e:
-        print(f"{ANSI_RESET}An error occurred during processing: {e}{ANSI_RESET}") 
-        print(f"{ANSI_RESET}Please ensure the llamafile server is still running and try again.{ANSI_RESET}") 
-    finally:
-        if llamafile_process and isinstance(llamafile_process, subprocess.Popen):
-            print("Terminating llamafile server...")
-            llamafile_process.terminate()
-            llamafile_process.wait(timeout=5)
-            if llamafile_process.poll() is None:
-                print("Llamafile process did not terminate gracefully, forcing kill.")
-                llamafile_process.kill()
-        else:
-            print("Llamafile process was not running or not successfully started by app.py. No process to terminate.")
-
+# --- Main execution block for app.py (now minimal) ---
 if __name__ == "__main__":
-    main()
+    # This block is for direct execution of app.py for testing its initialization
+    # In a real setup, web_ui.py would import and call initialize_rag_system()
+    print("This app.py is now designed as a backend module.")
+    print("Please run `web_ui.py` to interact with the application.")
+    
+    # You can uncomment the following lines for manual testing of app.py's initialization
+    # and then manually inspect the _llm_instance, _knowledge_bases objects.
+    # _llm_instance, _knowledge_bases, _llamafile_process = initialize_rag_system()
+    # if _llm_instance and _knowledge_bases:
+    #     print("RAG system initialized successfully for direct app.py test.")
+    # else:
+    #     print("RAG system initialization failed during direct app.py test.")
+    # input("Press Enter to exit (and terminate Llamafile if started by this script)...")
+    # if _llamafile_process and isinstance(_llamafile_process, subprocess.Popen):
+    #     print("Terminating Llamafile server from direct app.py exit.")
+    #     _llamafile_process.terminate()
+    #     _llamafile_process.wait(timeout=5)
+    #     if _llamafile_process.poll() is None:
+    #         _llamafile_process.kill()
 

@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ ui_config.ui_settings.app_title | default('RAG Summarizer') }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        /* Dynamic CSS variables from config.yaml */
+        :root {
+            --bg-image-url: {% if ui_config.ui_settings.background.type == 'image' %}url("{{ ui_config.ui_settings.background.value }}"){% else %}none{% endif %};
+            --bg-color-fallback: {{ ui_config.ui_settings.background.value if ui_config.ui_settings.background.type == 'color' else '#1a1a1a' }};
+            
+            --window-opacity: {{ ui_config.ui_settings.windows.common.opacity | default(0.85) }};
+            --window-bg-color: {{ ui_config.ui_settings.windows.common.background_color_fallback | default('rgba(0, 0, 0, 0.7)') }};
+            --window-border-radius: {{ ui_config.ui_settings.windows.common.border_radius | default('10px') }};
+            --window-padding: {{ ui_config.ui_settings.windows.common.padding | default('20px') }};
+
+            --input-text-color: {{ ui_config.ui_settings.windows.input_window.text_color | default('#FFFFFF') }};
+            --input-placeholder-color: {{ ui_config.ui_settings.windows.input_window.placeholder_color | default('rgba(255, 255, 255, 0.6)') }};
+
+            --llm-text-color: {{ ui_config.ui_settings.windows.llm_response_window.text_color | default('#E0FFFF') }};
+            --llm-font-size: {{ ui_config.ui_settings.windows.llm_response_window.font_size | default('16px') }};
+            --llm-line-height: {{ ui_config.ui_settings.windows.llm_response_window.line_height | default('1.6') }};
+
+            --references-text-color: {{ ui_config.ui_settings.windows.references_window.text_color | default('#ADD8E6') }};
+            --references-font-size: {{ ui_config.ui_settings.windows.references_window.font_size | default('14px') }};
+            --references-line-height: {{ ui_config.ui_settings.windows.references_window.line_height | default('1.4') }};
+
+            /* Colors for content within the LLM/References output (from config.yaml) */
+            --color-prompt-text: {{ ui_config.ui_settings.colors.prompt_text | default('#FFFF00') }};
+            --color-ai-stream-text: {{ ui_config.ui_settings.colors.ai_stream_text | default('#87CEEB') }};
+            --color-title-text: {{ ui_config.ui_settings.colors.title_text | default('#FF8C00') }};
+            --color-summary-text: {{ ui_config.ui_settings.colors.summary_text | default('#B0E0E6') }};
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>{{ ui_config.ui_settings.app_title | default('RAG Summarizer') }}</h1>
+        
+        <div id="init-status" class="status-message">Initializing RAG system... Please wait.</div>
+
+        <div class="window input-window">
+            <input type="text" id="query-input" placeholder="Type your query here (e.g., get headlines today from cnn.com)" autofocus>
+            <button id="submit-button">Submit</button>
+        </div>
+
+        <div class="output-windows">
+            <div class="window llm-response-window">
+                <h2>LLM Response</h2>
+                <pre id="llm-response-output" class="llm-response"></pre>
+            </div>
+
+            <div class="window references-window">
+                <h2>Referenced Articles / Thinking Process</h2>
+                <pre id="references-output" class="references-output"></pre>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const queryInput = document.getElementById('query-input');
+        const submitButton = document.getElementById('submit-button');
+        const llmOutput = document.getElementById('llm-response-output');
+        const referencesOutput = document.getElementById('references-output');
+        const initStatus = document.getElementById('init-status');
+
+        let isStreaming = false;
+        let rag_system_initialized = false; 
+
+        function escapeHtml(text) {
+            return text
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
+        function applyAnsiColors(text) {
+            text = text.replace(/\x1b\[1;33m/g, '<span style="color: var(--color-prompt-text);">'); // Yellow
+            text = text.replace(/\x1b\[38;5;208m/g, '<span style="color: var(--color-title-text);">'); // Orange
+            text = text.replace(/\x1b\[94m/g, '<span style="color: var(--color-summary-text);">'); // Light Blue
+            text = text.replace(/\x1b\[0m/g, '</span>'); // Reset
+
+            let openSpans = (text.match(/<span/g) || []).length;
+            let closeSpans = (text.match(/<\/span>/g) || []).length;
+            for (let i = 0; i < (openSpans - closeSpans); i++) {
+                text += '</span>';
+            }
+            return text;
+        }
+
+        const initSource = new EventSource('/stream_init_status');
+        initSource.onmessage = function(event) {
+            const data = JSON.parse(event.data);
+            if (data.type === 'init_complete') {
+                rag_system_initialized = data.success; 
+                if (data.success) {
+                    initStatus.textContent = "RAG system ready!";
+                    initStatus.style.backgroundColor = 'rgba(0, 128, 0, 0.7)'; 
+                    submitButton.disabled = false;
+                    queryInput.disabled = false;
+                } else {
+                    initStatus.textContent = "RAG system failed to initialize. " + (data.error || "");
+                    initStatus.style.backgroundColor = 'rgba(255, 0, 0, 0.7)'; 
+                }
+                initSource.close();
+            }
+        };
+        initSource.onerror = function(err) {
+            console.error("EventSource failed:", err);
+            initStatus.textContent = "Error connecting to init stream.";
+            initStatus.style.backgroundColor = 'rgba(255, 0, 0, 0.7)';
+            initSource.close();
+        };
+
+        async function submitQuery() {
+            if (isStreaming || !rag_system_initialized) {
+                if (!rag_system_initialized) {
+                    alert("RAG system is not initialized yet. Please wait.");
+                }
+                return;
+            }
+
+            const query = queryInput.value;
+            if (!query) return;
+
+            llmOutput.innerHTML = ''; 
+            referencesOutput.innerHTML = ''; // Clear references output at the start of a new query
+            submitButton.disabled = true;
+            queryInput.disabled = true;
+            isStreaming = true;
+
+            try {
+                const response = await fetch('/query', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ query: query })
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    llmOutput.textContent = `Error: ${errorData.error || response.statusText}`;
+                    isStreaming = false;
+                    submitButton.disabled = false;
+                    queryInput.disabled = false;
+                    return;
+                }
+
+                const source = new EventSource('/stream_response');
+                source.onmessage = function(event) {
+                    const data = JSON.parse(event.data);
+                    if (data.type === 'llm_chunk') {
+                        llmOutput.innerHTML += applyAnsiColors(escapeHtml(data.content));
+                        llmOutput.scrollTop = llmOutput.scrollHeight; 
+                    } else if (data.type === 'end_stream') {
+                        isStreaming = false;
+                        submitButton.disabled = false;
+                        queryInput.disabled = false;
+                        source.close(); 
+                        queryInput.value = ''; 
+
+                        // Display referenced articles (for direct_headlines)
+                        if (data.results && data.results.referenced_articles && data.results.referenced_articles.length > 0) {
+                            referencesOutput.innerHTML = '<h3>Raw Headlines from File System:</h3>';
+                            data.results.referenced_articles.forEach((item, index) => {
+                                referencesOutput.innerHTML += `<p>${index + 1}. <span style="color: var(--color-prompt-text);">Title:</span> <span style="color: var(--color-title-text);">${escapeHtml(item.title)}</span> <span style="color: var(--color-prompt-text);">Summary:</span> <span style="color: var(--color-summary-text);">${escapeHtml(item.summary)}</span><br>(Source: ${escapeHtml(item.source)}, Site: ${escapeHtml(item.site_origin)})</p><hr>`;
+                            });
+                        } 
+                        // Display citations (for other RAG queries)
+                        else if (data.results && data.results.citations && data.results.citations.length > 0) {
+                            referencesOutput.innerHTML = '<h3>Referenced Documents (from ChromaDB):</h3>';
+                            data.results.citations.forEach((doc, index) => {
+                                const sourceName = escapeHtml(doc.metadata.source || 'N/A');
+                                const originalTitle = escapeHtml(doc.metadata.original_title || 'N/A');
+                                const contentSnippet = escapeHtml(doc.page_content ? doc.page_content.substring(0, 200) + '...' : 'No content snippet available');
+                                
+                                referencesOutput.innerHTML += `<p>${index + 1}. <span style="color: var(--color-prompt-text);">Source:</span> ${sourceName} <span style="color: var(--color-prompt-text);">Title:</span> <span style="color: var(--color-title-text);">${originalTitle}</span><br><span style="color: var(--color-prompt-text);">Content Snippet:</span> <span style="color: var(--color-summary-text);">${contentSnippet}</span></p><hr>`;
+                            });
+                        } else {
+                            referencesOutput.innerHTML = '<p>No specific articles or documents referenced.</p>';
+                        }
+                        referencesOutput.scrollTop = referencesOutput.scrollHeight; 
+                    }
+                };
+                source.onerror = function(err) {
+                    console.error("EventSource failed:", err);
+                    llmOutput.textContent += "\nError receiving streamed response.";
+                    isStreaming = false;
+                    submitButton.disabled = false;
+                    queryInput.disabled = false;
+                    source.close();
+                };
+
+            } catch (error) {
+                llmOutput.textContent = `Network Error: ${error.message}`;
+                isStreaming = false;
+                submitButton.disabled = false;
+                queryInput.disabled = false;
+            }
+        }
+
+        submitButton.addEventListener('click', submitQuery);
+        queryInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                submitQuery();
+            }
+        });
+
+        submitButton.disabled = true;
+        queryInput.disabled = true;
+    </script>
+</body>
+</html>
+
