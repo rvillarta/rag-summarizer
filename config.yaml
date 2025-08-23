@@ -2,7 +2,7 @@ ui_settings:
   app_title: "VERA"
   background:
     type: "image" # or "color"
-    value: "https://images.unsplash.com/photo-1518655048521-f130df041f66?q=80&w=2070&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D" # Example URL
+    value: "static/images/spacegarden2.png"
     # value: "#1a1a1a" # Example for solid color background (uncomment to use)
   windows:
     common:
@@ -26,6 +26,7 @@ ui_settings:
     ai_stream_text: "#87CEEB" # Sky Blue (for LLM streamed output)
     title_text: "#FF8C00" # Dark Orange
     summary_text: "#B0E0E6" # Powder Blue
+  auto_open_browser: true # Add this line: set to true to auto-open, false to disable
 
 llm_prompts:
   executive_summary_prompt: |
@@ -39,9 +40,30 @@ llm_prompts:
 
     Executive Summary:
   system_instruction_prompt: |
-    You are a helpful, accurate, and concise assistant.
-    Prioritize answering questions based on the provided document context.
-    If information for the question is found in the document, preface your answer or relevant section with: "**Based on the provided document [Source: source_filename, Title: original_title if available]:**"
-    If the provided context is insufficient or the question requires broader knowledge, preface your answer or relevant section with: "**Drawing on general knowledge:**"
-    If the answer cannot be found in the provided document, explicitly state: "Information for this question is not available in the provided document." before potentially offering a general answer if appropriate.
+    You are a highly capable and precise assistant.
+    Your **ABSOLUTE PRIMARY OBJECTIVE** is to **DIRECTLY AND ACCURATELY ANSWER THE USER'S QUESTION** by extracting specific facts and details **EXCLUSIVELY FROM THE PROVIDED DOCUMENT(S) CONTEXT(S)**.
+    
+    **CRITICAL AND UNYIELDING INSTRUCTIONS:**
+    1.  **ANSWER DIRECTLY:** Formulate your response to directly address the user's specific question. Extract specific facts and details from the context to form your answer. Do not provide general summaries of documents unless the question explicitly asks for a summary.
+    2.  **UTILIZE ALL RELEVANT CONTEXT:** Every piece of information in the provided context that is relevant to the user's question MUST be used to formulate your answer.
+    4.  **NEVER, EVER DISCLAIM CONTEXT:** If a source or piece of information is present in the provided context, you **MUST** treat it as part of the provided document. You **ARE FORBIDDEN** from stating that a provided source is not part of the document.
+    5.  **STRICT FALLBACK:** ONLY if the provided document context is **absolutely and entirely insufficient** to answer the question, or if the question explicitly asks for broader knowledge, preface your answer or relevant section with: "**Drawing on general knowledge:**".
+    
+    Adhere to these instructions with utmost precision.
+
+retriever_settings:
+  search_type: "similarity" # Options: "similarity", "mmr". Default is "similarity".
+  k: 4 # Number of final documents/chunks to pass to the LLM.
+  fetch_k: 20 # Number of documents to fetch before applying MMR re-ranking (only used if search_type is "mmr").
+  lambda_mult: 0.5 # Diversity vs. relevance trade-off for MMR (0.0 means max diversity, 1.0 means max relevance).
+  score_threshold: 0.00 # Minimum similarity score for a document/chunk to be considered. Set to None to disable.
+  text_splitter:
+    chunk_size: 1000
+    chunk_overlap: 200
+
+debug_settings:
+  enable_debug_logging: False # Set to false to disable extensive debug prints
+
+progress_bar_settings:
+  total_initialization_steps: 10 # Approximate total steps for initialization (Llamafile, LLM, KBs)
 

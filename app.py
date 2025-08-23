@@ -15,6 +15,7 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import re 
 import json 
+import queue # Import queue for type hinting, though the actual queue comes from web_ui
 
 # --- Configuration (No ANSI colors here, handled by UI) ---
 # Base directory for all your document data
@@ -59,19 +60,35 @@ Input Headlines and Summaries:
 Executive Summary:"""
 
 # System Instruction Prompt for general Q&A and for LLM in handle_summary_query
-SYSTEM_INSTRUCTION_PROMPT = """You are a helpful, accurate, and concise assistant.
-Prioritize answering questions based on the provided document context.
-If information for the question is found in the document, preface your answer or relevant section with: "**Based on the provided document [Source: source_filename, Title: original_title if available]:**"
-If the provided context is insufficient or the question requires broader knowledge, preface your answer or relevant section with: "**Drawing on general knowledge:**"
-If the answer cannot be found in the provided document, explicitly state: "Information for this question is not available in the provided document." before potentially offering a general answer if appropriate."""
+SYSTEM_INSTRUCTION_PROMPT = """You are a highly capable and precise assistant.
+Your **ABSOLUTE PRIMARY OBJECTIVE** is to **DIRECTLY AND ACCURATELY ANSWER THE USER'S QUESTION** by extracting specific facts and details **EXCLUSIVELY FROM THE PROVIDED DOCUMENT CONTEXT**.
+    
+**CRITICAL AND UNYIELDING INSTRUCTIONS:**
+1.  **ANSWER DIRECTLY:** Formulate your response to directly address the user's specific question. Extract specific facts and details from the context to form your answer. Do not provide general summaries of documents unless the question explicitly asks for a summary.
+2.  **UTILIZE ALL RELEVANT CONTEXT:** Every piece of information in the provided context that is relevant to the question, you MUST use it to formulate your answer.
+3.  **UNFAILINGLY CITE:** ALWAYS preface your answer or any information taken from the context with: "**Based on the provided document [Source: source_filename, Title: original_title if available]:**". If multiple sources are used for a single point, cite them all.
+4.  **NEVER, EVER DISCLAIM CONTEXT:** If a source or piece of information is present in the provided context, you **MUST** treat it as part of the provided document. You **ARE FORBIDDEN** from stating that a provided source is not part of the document.
+5.  **STRICT FALLBACK:** ONLY if the provided document context is **absolutely and entirely insufficient** to answer the question, or if the question explicitly asks for broader knowledge, preface your answer or relevant section with: "**Drawing on general knowledge:**".
+6.  **FINAL RESORT - NO INFO:** If, after exhaustively searching the provided document context, the answer is genuinely not present, explicitly state: "Information for this question is not available in the provided document." before potentially offering a general answer if appropriate.
+    
+Adhere to these instructions with utmost precision.
+"""
 
 
 # --- Global Instances (will be initialized once) ---
 _llm_instance = None
 _knowledge_bases = {}
 _llamafile_process = None # To hold the subprocess object if started by app.py
+_retriever_settings = {} # New global for retriever settings
+_debug_logging_enabled = False # New global for debug logging state
 
 # --- Helper Functions ---
+
+def _log_debug(message):
+    """Helper function for conditional debug logging."""
+    global _debug_logging_enabled
+    if _debug_logging_enabled:
+        print(f"DEBUG: {message}")
 
 def is_headline_query(query):
     """
@@ -150,7 +167,7 @@ def parse_date_and_site_from_query(query):
                 start_date = specific_date.replace(hour=0, minute=0, second=0, microsecond=0)
                 end_date = specific_date.replace(hour=23, minute=59, second=59, microsecond=999999)
                 filters["publication_date"] = {"$gte": start_date.isoformat(), "$lte": end_date.isoformat()}
-                cleaned_query = re.sub(pattern, '', cleaned_query, flags=re.IGNORECASE).strip()
+                cleaned_query = re.sub(date_match.group(0), '', cleaned_query, flags=re.IGNORECASE).strip()
                 date_filter_applied = True
             except ValueError:
                 pass # Invalid date format, continue without date filter
@@ -276,7 +293,7 @@ def load_documents_from_directory(directory: Path, load_summaries=False, summary
                                             metadata["site_origin"] = metadata["site_origin"][4:] 
                                         doc_metadata.update(metadata) 
                                         
-                                        print(f"    DEBUG: Loaded doc: {file_name}, Site: {doc_metadata.get('site_origin')}, Summary Length: {len(content_to_load)}")
+                                        _log_debug(f"Loaded doc: {file_name}, Site: {doc_metadata.get('site_origin')}, Summary Length: {len(content_to_load)}")
 
                                         documents.append(LcDocument(page_content=content_to_load, metadata=doc_metadata))
                                     else:
@@ -373,11 +390,12 @@ def load_documents_from_directory(directory: Path, load_summaries=False, summary
     return documents
 
 
-def initialize_vector_store_for_category(documents, category_name: str, use_summaries=False):
+def initialize_vector_store_for_category(documents, category_name: str, use_summaries=False, text_splitter_params=None):
     """
     Initializes or loads a ChromaDB vector store for a specific category.
     Each category gets its own persistent directory within BASE_VECTOR_DB_DIR.
     If use_summaries is True, it expects documents loaded with summaries as page_content.
+    text_splitter_params can be used to customize chunking.
     """
     category_db_path = BASE_DATA_DIR / "vectorstores" / category_name
     print(f"Initializing embeddings model for {category_name}...")
@@ -389,12 +407,22 @@ def initialize_vector_store_for_category(documents, category_name: str, use_summ
             shutil.rmtree(category_db_path)
             print(f"Cleared existing vector store at {category_db_path}")
 
-        # Text splitting for full documents, but not for already short summaries
-        if not use_summaries:
+        # Apply text splitting if not in summary mode and params are provided
+        splits = documents
+        if not use_summaries and text_splitter_params:
+            print(f"  Applying custom text splitting for {category_name}: chunk_size={text_splitter_params['chunk_size']}, chunk_overlap={text_splitter_params['chunk_overlap']}")
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=text_splitter_params.get("chunk_size", 1000),
+                chunk_overlap=text_splitter_params.get("chunk_overlap", 200)
+            )
+            splits = text_splitter.split_documents(documents)
+        elif not use_summaries: # Default splitting if no custom params and not summaries
+            print("  Applying default text splitting (chunk_size=1000, chunk_overlap=200) for full documents.")
             text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
             splits = text_splitter.split_documents(documents)
         else:
-            splits = documents # Summaries are already short enough, no need to split
+            print("  Skipping text splitting for summaries (already pre-processed).")
+            # splits = documents # Already set to documents above
 
         vectorstore = Chroma.from_documents(
             documents=splits,
@@ -415,10 +443,11 @@ def initialize_vector_store_for_category(documents, category_name: str, use_summ
             return None
     return vectorstore
 
-def start_llamafile_server():
+def start_llamafile_server(response_queue: queue.Queue, current_step: list, total_steps: int):
     """
     Starts the llamafile server as a subprocess and waits for it to become ready.
     Implements a robust retry mechanism, logging llamafile's output to a file.
+    Reports progress to the response_queue.
     """
     llamafile_path = Path(LLAMAFILE_NAME)
     if not llamafile_path.exists():
@@ -431,21 +460,26 @@ def start_llamafile_server():
         client = OpenAI(base_url=LLAMAFILE_API_BASE, api_key="sk-no-key-required", timeout=5.0) 
         client.models.list() 
         print("Llamafile server appears to be already running and responsive.")
+        current_step[0] += 1
+        response_queue.put({"type": "init_progress", "stage": "Llamafile server already running", "percentage": int((current_step[0] / total_steps) * 100)})
         return None, None # Return None for process and error if already running
     except Exception:
         pass # Llamafile not running, proceed to start it
 
     print(f"Attempting to start llamafile server with GPU offload: {LLAMAFILE_NAME} -ngl {GPU_OFFLOAD_LAYERS}...")
     print(f"Llamafile server output will be logged to: {LLAMAFILE_LOG_FILE}")
+    current_step[0] += 1
+    response_queue.put({"type": "init_progress", "stage": "Starting Llamafile server", "percentage": int((current_step[0] / total_steps) * 100)})
 
     log_file_handle = open(LLAMAFILE_LOG_FILE, 'w') # Open in write mode to clear previous logs
     try:
+        # ADDED --nobrowser FLAG HERE
         command_str = ( 
-            f"./{llamafile_path.name} --server --host 0.0.0.0 --port 8080 "
+            f"./{llamafile_path.name} --server --host 0.0.0.0 --port 8080 --nobrowser "
             f"-ngl {GPU_OFFLOAD_LAYERS} > {LLAMAFILE_LOG_FILE} 2>&1"
         )
         if GPU_OFFLOAD_LAYERS == 0:
-            command_str = f"./{llamafile_path.name} --server --host 0.0.0.0 --port 8080 > {LLAMAFILE_LOG_FILE} 2>&1"
+            command_str = f"./{llamafile_path.name} --server --host 0.0.0.0 --port 8080 --nobrowser > {LLAMAFILE_LOG_FILE} 2>&1"
 
         process = subprocess.Popen(
             command_str, 
@@ -465,26 +499,36 @@ def start_llamafile_server():
                 client = OpenAI(base_url=LLAMAFILE_API_BASE, api_key="sk-no-key-required", timeout=10.0)
                 client.models.list() 
                 print("\nLlamafile server successfully connected and is ready!")
+                current_step[0] += 1
+                response_queue.put({"type": "init_progress", "stage": "Llamafile server connected", "percentage": int((current_step[0] / total_steps) * 100)})
                 return process, None 
             except Exception:
                 if process.poll() is not None: 
                     print("\nLlamafile server process terminated unexpectedly during startup.")
                     print(f"Please check '{LLAMAFILE_LOG_FILE}' for error details.")
+                    current_step[0] += 1
+                    response_queue.put({"type": "init_progress", "stage": "Llamafile startup failed", "percentage": int((current_step[0] / total_steps) * 100)})
                     return None, f"Llamafile process terminated unexpectedly. Check {LLAMAFILE_LOG_FILE}"
                 time.sleep(check_interval)
         
         if process.poll() is None:
             print("\nLlamafile server did not become ready within the timeout period.")
             print(f"Please check '{LLAMAFILE_LOG_FILE}' for potential startup logs.")
+            current_step[0] += 1
+            response_queue.put({"type": "init_progress", "stage": "Llamafile startup timed out", "percentage": int((current_step[0] / total_steps) * 100)})
             return None, f"Llamafile server timed out during startup. Check {LLAMAFILE_LOG_FILE}"
         else: 
             print("\nLlamafile server process terminated unexpectedly during startup check (after loop).")
             print(f"Please check '{LLAMAFILE_LOG_FILE}' for error details.")
+            current_step[0] += 1
+            response_queue.put({"type": "init_progress", "stage": "Llamafile startup failed", "percentage": int((current_step[0] / total_steps) * 100)})
             return None, f"Llamafile process terminated unexpectedly. Check {LLAMAFILE_LOG_FILE}"
 
     except Exception as e:
         print(f"Failed to launch llamafile server. Error details: {e}")
         print(f"Please ensure '{LLAMAFILE_NAME}' is executable (chmod +x) and compatible with your system.")
+        current_step[0] += 1
+        response_queue.put({"type": "init_progress", "stage": f"Llamafile launch failed: {e}", "percentage": int((current_step[0] / total_steps) * 100)})
         return None, f"Failed to launch llamafile server: {e}"
     finally:
         log_file_handle.close() 
@@ -518,16 +562,31 @@ def parse_user_input(user_input, available_kbs_keys):
     query_text_for_llm = user_input 
     metadata_filter = None 
     
-    # Check for explicit category prefix
+    # Check for explicit category prefix(es)
     if ':' in user_input:
-        parts = user_input.split(':', 1)
-        category_prefix = parts[0].strip().lower()
-        if category_prefix in available_kbs_keys:
-            selected_category = category_prefix
-            original_query_text = parts[1].strip() 
-            query_text_for_llm = original_query_text 
+        parts = user_input.split(':')
+        kb_prefixes_raw = [p.strip().lower() for p in parts[:-1]]
+        query_after_prefix = parts[-1].strip()
+        kb_prefixes_joined = ':'.join(kb_prefixes_raw)
+
+        _log_debug(f"kb_prefixes_raw before split: '{kb_prefixes_raw}'")
+        # Handle multiple KB prefixes separated by commas or colons
+        # Ensure splitting handles empty strings if multiple delimiters are adjacent
+        kb_names_split = [kb.strip() for kb in re.split(r'[:,]', kb_prefixes_joined) if kb.strip()]
+        _log_debug(f"kb_names_split: {kb_names_split}")
+
+        valid_kb_names = [kb for kb in kb_names_split if kb in available_kbs_keys]
+        _log_debug(f"valid_kb_names: {valid_kb_names} len={len(valid_kb_names)}")
+
+        if valid_kb_names:
+            if len(valid_kb_names) > 1:
+                selected_category = valid_kb_names # List of KBs
+            else:
+                selected_category = valid_kb_names[0] # Single KB string
+            original_query_text = query_after_prefix
+            query_text_for_llm = query_after_prefix
         else:
-            print(f"Invalid category '{category_prefix}'. Attempting intelligent routing.")
+            print(f"Invalid category prefix(es) '{kb_prefixes_raw}'. Attempting intelligent routing.")
             # selected_category remains 'auto' for intelligent routing/fallback
 
     # Determine if it's a summary request (news, blog, social media) for auto-routing
@@ -558,16 +617,6 @@ def parse_user_input(user_input, available_kbs_keys):
                 query_text_for_llm = cleaned_query_after_filter
             # If no specific filter was found, query_text_for_llm remains original_query_text
 
-
-    # If an explicit summary KB was selected (e.g., NEWS_SUMMARIES:), apply filters for that KB
-    # This block is now redundant because the logic above handles it.
-    # if selected_category in ['news_summaries', 'blog_summaries', 'social_media_summaries'] and not is_summary_req_auto_detected:
-    #     parsed_filter, cleaned_query_after_filter = parse_date_and_site_from_query(original_query_text)
-    #     if parsed_filter:
-    #         metadata_filter = parsed_filter
-    #         query_text_for_llm = cleaned_query_after_filter 
-    #     # If no specific filter was found, query_text_for_llm remains original_query_text
-
     return selected_category, original_query_text, query_text_for_llm, metadata_filter
 
 # --- New Function: get_headlines_from_filesystem ---
@@ -584,7 +633,7 @@ def get_headlines_from_filesystem(original_query_text, metadata_filter):
     dirs_to_walk = []
     potential_subdirs = [d for d in NEWS_DIR.iterdir() if d.is_dir()] 
     if potential_subdirs:
-        dirs_to_walk.extend(potential_subdirs)
+            dirs_to_walk.extend(potential_subdirs)
     else:
         dirs_to_walk = [NEWS_DIR] # Fallback if no timestamped subdirs
 
@@ -656,13 +705,17 @@ def get_headlines_from_filesystem(original_query_text, metadata_filter):
 
 # --- Renamed and Updated Summary Handler Function ---
 
-def handle_summary_query(llm, summary_vectorstore, original_query_text, query_text_for_llm, metadata_filter, HEADLINE_SUMMARIZER_PROMPT, SYSTEM_INSTRUCTION_PROMPT, kb_name_for_print="Summaries"):
+def handle_summary_query(llm, summary_vectorstore, original_query_text, query_text_for_llm, metadata_filter, SYSTEM_INSTRUCTION_PROMPT, retriever_settings, kb_name_for_print="Summaries"):
     """
     Handles queries specifically for summaries (news, blog, social media).
     This function uses ChromaDB and the LLM for semantic search and synthesis.
+    Returns a generator for LLM chunks and a list of retrieved documents (citations).
     """
     print(f"Searching and generating high-level overview from '{kb_name_for_print.upper()}' knowledge base (streaming)...")
     
+    retrieved_docs_raw = []
+    llm_response_generator = None
+
     if summary_vectorstore:
         embeddings_model = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
         
@@ -686,8 +739,8 @@ def handle_summary_query(llm, summary_vectorstore, original_query_text, query_te
             elif len(conditions) > 1:
                 chroma_where_clause = {"$and": conditions}
 
-        print(f"  DEBUG: Initial metadata_filter: {metadata_filter}")
-        print(f"  DEBUG: Constructed chroma_where_clause: {chroma_where_clause}")
+        _log_debug(f"Initial metadata_filter: {metadata_filter}")
+        _log_debug(f"Constructed chroma_where_clause: {chroma_where_clause}")
 
         retrieved_docs_raw = []
         try:
@@ -697,13 +750,61 @@ def handle_summary_query(llm, summary_vectorstore, original_query_text, query_te
             
             print(f"  Using ChromaDB .query() for semantic search with filters (if any). Query embedding based on: '{final_query_text_for_embedding}'")
             
-            results = chroma_client_collection.query(
-                query_embeddings=[query_embedding],
-                n_results=100, # Retrieve a large number to ensure filter covers all matches
-                where=chroma_where_clause, # Apply the correctly formatted filter
-                include=['documents', 'metadatas', 'distances']
-            )
+            # Apply retriever settings for direct ChromaDB query
+            n_results = retriever_settings.get("k", 4) # Default to 4 if not in config
+            if retriever_settings.get("search_type") == "mmr":
+                 n_results = retriever_settings.get("fetch_k", 20) # Use fetch_k for initial retrieval in MMR
+            
+            score_threshold = retriever_settings.get("score_threshold") 
+            
+            # Explicitly define query parameters to ensure no unexpected arguments are passed
+            query_params = {
+                "query_embeddings": [query_embedding],
+                "n_results": n_results, 
+                "where": chroma_where_clause,
+                "include": ['documents', 'metadatas', 'distances']
+            }
 
+            _log_debug(f"Calling chroma_client_collection.query() with params: {query_params}")
+            results = chroma_client_collection.query(**query_params)
+
+            # Manual filtering based on score_threshold
+            if results['documents'] and score_threshold is not None:
+                filtered_documents = []
+                # Assuming Chroma's distance is 1 - cosine_similarity (0-2 scale).
+                # So, if score_threshold in config is a *cosine similarity* (e.g., 0.75 to 1.0),
+                # then `distance` should be `1 - similarity_score`, so `distance <= 1 - score_threshold`.
+                # E.g., if score_threshold=0.75, then distance <= 0.25.
+                max_distance_for_threshold = (1 - score_threshold) if (score_threshold >=0 and score_threshold <=1) else None # Ensure valid range
+
+                if max_distance_for_threshold is not None:
+                    _log_debug(f"Applying manual score_threshold: {score_threshold} (which means max_distance: {max_distance_for_threshold})")
+                    for i in range(len(results['documents'])):
+                        distance = results['distances'][i][0] 
+                        if distance <= max_distance_for_threshold: 
+                            filtered_documents.append({
+                                "document": results['documents'][i][0],
+                                "metadata": results['metadatas'][i][0],
+                                "distance": distance
+                            })
+                else:
+                    _log_debug(f"Invalid score_threshold '{score_threshold}' in config. Skipping manual filtering.")
+                    # If threshold is invalid or None, don't filter, just use all results
+                    for i in range(len(results['documents'])):
+                        filtered_documents.append({
+                            "document": results['documents'][i][0],
+                            "metadata": results['metadatas'][i][0],
+                            "distance": results['distances'][i][0]
+                        })
+
+                # Re-populate results from filtered_documents
+                results['documents'] = [[d['document']] for d in filtered_documents]
+                results['metadatas'] = [[d['metadata']] for d in filtered_documents]
+                results['distances'] = [[d['distance']] for d in filtered_documents]
+                
+                if not results['documents']:
+                    _log_debug(f"No documents left after applying score_threshold: {score_threshold}")
+            
             if results['documents']:
                 for i in range(len(results['documents'])):
                     doc_content = results['documents'][i][0]
@@ -734,16 +835,11 @@ def handle_summary_query(llm, summary_vectorstore, original_query_text, query_te
         print(f"  Retrieved {len(retrieved_docs_raw)} raw summaries, kept {len(retrieved_docs)} unique summaries.")
 
         if not retrieved_docs:
-            user_query_content = f"Question: {original_query_text}\nAnswer:"
-            messages_for_llm = [
-                {"role": "system", "content": SYSTEM_INSTRUCTION_PROMPT},
-                {"role": "user", "content": user_query_content}
-            ]
-            # Return empty string and empty list if no results, to indicate no LLM response from docs
-            return "No relevant summaries found in the '{kb_name_for_print}' knowledge base for your query.", []
+            llm_response_generator = iter(["No relevant summaries found in the '{kb_name_for_print}' knowledge base for your query.".format(kb_name_for_print=kb_name_for_print)])
+            return llm_response_generator, []
         else:
             headline_context_parts = []
-            print("\n--- DEBUG: Details of Retrieved Documents (from handle_summary_query, after filter) ---")
+            print("\n--- Details of Retrieved Documents (from handle_summary_query, after filter) ---")
             for i, doc in enumerate(retrieved_docs):
                 print(f"  Document {i+1}:")
                 print(f"    Chroma Doc ID: {doc.metadata.get('id', 'N/A')}") 
@@ -753,7 +849,7 @@ def handle_summary_query(llm, summary_vectorstore, original_query_text, query_te
                 print(f"    Full Article Summary (page_content):\n{doc.page_content}\n")
                 print(f"    All Metadata: {doc.metadata}")
                 print("-" * 20)
-            print("--- END DEBUG ---\n")
+            print("--- END DETAILS ---\n")
             
             for doc in retrieved_docs:
                 title = doc.metadata.get("original_title", "No Title")
@@ -763,74 +859,214 @@ def handle_summary_query(llm, summary_vectorstore, original_query_text, query_te
                 headline_context_parts.append(f"- Source: {source_info}, Site: {site_origin}, Title: {title}, Summary: {summary}")
             
             context_str = "\n".join(headline_context_parts)
-            user_query_content = HEADLINE_SUMMARIZER_PROMPT.format(context=context_str)
+            user_query_content = EXECUTIVE_SUMMARY_PROMPT.format(context=context_str) # Use EXECUTIVE_SUMMARY_PROMPT for synthesis
             messages_for_llm = [
                 {"role": "system", "content": SYSTEM_INSTRUCTION_PROMPT},
                 {"role": "user", "content": user_query_content}
             ]
             
-            # Stream LLM response
-            llm_response_content = ""
-            for chunk in llm.stream(messages_for_llm):
-                if chunk.content:
-                    llm_response_content += chunk.content
-            
-            # Return LLM response and retrieved docs for UI to display
-            return llm_response_content, retrieved_docs
+            llm_response_generator = (chunk.content for chunk in llm.stream(messages_for_llm)) # Yield content directly
+            return llm_response_generator, retrieved_docs
     else:
-        return f"Error: {kb_name_for_print} knowledge base not loaded. Cannot provide overview.", []
+        llm_response_generator = iter(["Error: {kb_name_for_print} knowledge base not loaded. Cannot provide overview.".format(kb_name_for_print=kb_name_for_print)])
+        return llm_response_generator, []
 
-def handle_general_query(llm, knowledge_bases_dict, original_query_text, query_text_for_llm, target_kb_names, SYSTEM_INSTRUCTION_PROMPT):
+def handle_general_query(llm, knowledge_bases_dict, original_query_text, query_text_for_llm, target_kb_names, SYSTEM_INSTRUCTION_PROMPT, retriever_settings):
     """
     Handles general document queries, which might target a specific KB or all content KBs.
     `target_kb_names` can be a single KB name string or a list of KB names.
+    Returns a generator for LLM chunks and a list of retrieved documents (citations).
     """
-    retrieved_docs = []
+    all_retrieved_docs_with_scores = [] # To store (Document, score) tuples
     
-    if isinstance(target_kb_names, str): # Single KB specified
-        kb_name = target_kb_names
+    # Ensure target_kb_names is always a list for iteration
+    if isinstance(target_kb_names, str):
+        kbs_to_query = [target_kb_names]
+    else: # It's already a list
+        kbs_to_query = target_kb_names
+
+    print(f"Searching across knowledge bases: {', '.join(kb.upper() for kb in kbs_to_query)} (streaming)...")
+
+    # Construct search_kwargs based on retriever_settings, but without score_threshold for now
+    # We will apply score_threshold manually after retrieval
+    search_kwargs_for_retriever = {"k": retriever_settings.get("k", 4)} 
+    search_type = retriever_settings.get("search_type", "similarity")
+
+    if search_type == "mmr":
+        search_kwargs_for_retriever["fetch_k"] = retriever_settings.get("fetch_k", 20)
+        search_kwargs_for_retriever["lambda_mult"] = retriever_settings.get("lambda_mult", 0.5)
+    
+    # Get score_threshold from settings, but don't pass it to the retriever directly
+    score_threshold = retriever_settings.get("score_threshold")
+    if score_threshold is not None:
+        _log_debug(f"Manual score_threshold will be applied: {score_threshold}")
+
+    for kb_name in kbs_to_query:
         current_vectorstore = knowledge_bases_dict.get(kb_name)
         if current_vectorstore:
-            print(f"Searching and generating response from '{kb_name.upper()}' knowledge base (streaming)...")
-            retriever = current_vectorstore.as_retriever()
-            retrieved_docs.extend(retriever.get_relevant_documents(query_text_for_llm))
-        else:
-            print(f"Knowledge base '{kb_name}' not loaded. Skipping search.")
-    elif isinstance(target_kb_names, list): # Multiple KBs (e.g., for 'all' or 'auto' fallback)
-        print(f"Searching across multiple knowledge bases:{', '.join(kb.upper() for kb in target_kb_names)} (streaming)...")
-        for kb_name in target_kb_names:
-            current_vectorstore = knowledge_bases_dict.get(kb_name)
-            if current_vectorstore:
-                print(f"  Querying {kb_name.upper()} knowledge base...")
-                retriever = current_vectorstore.as_retriever()
-                retrieved_docs.extend(retriever.get_relevant_documents(query_text_for_llm))
+            print(f"  Querying {kb_name.upper()} knowledge base with search_type='{search_type}' and search_kwargs={search_kwargs_for_retriever}...")
+            
+            # Retrieve documents with scores
+            initial_retrieval_k = search_kwargs_for_retriever.get("fetch_k", 20) \
+                                  if search_type == "mmr" \
+                                  else search_kwargs_for_retriever.get("k", 4)
+            
+            temp_docs_with_scores = current_vectorstore.similarity_search_with_relevance_scores(
+                query_text_for_llm,
+                k=initial_retrieval_k
+            )
+            
+            # Apply score_threshold
+            if score_threshold is not None:
+                temp_docs_with_scores = [
+                    (doc, score) for doc, score in temp_docs_with_scores if score >= score_threshold
+                ]
+                _log_debug(f"{len(temp_docs_with_scores)} docs kept after score_threshold {score_threshold} for '{kb_name}'.")
             else:
-                print(f"  Knowledge base '{kb_name}' not loaded. Skipping.")
+                _log_debug(f"No score_threshold applied for '{kb_name}'.")
 
-    if not retrieved_docs:
-        llm_response_content = "No relevant documents found in the selected knowledge base(s) for your query."
+            # If MMR is requested, apply MMR re-ranking to the filtered set
+            if search_type == "mmr" and temp_docs_with_scores:
+                _log_debug(f"Applying MMR re-ranking to {len(temp_docs_with_scores)} filtered documents for '{kb_name}'.")
+                
+                # Extract just the documents for MMR input
+                docs_for_mmr = [doc for doc, _ in temp_docs_with_scores]
+                
+                # Create a temporary retriever for MMR on the filtered set
+                # This is a workaround as LangChain's MMR retriever expects a vectorstore.
+                # A more robust solution would involve a custom re-ranker after initial retrieval.
+                # For this specific error, the key is to avoid passing score_threshold directly
+                # to the as_retriever method.
+                
+                # We need to create a retriever instance for MMR without the score_threshold
+                # in its search_kwargs.
+                mmr_retriever_kwargs = {
+                    "fetch_k": search_kwargs_for_retriever.get("fetch_k", 20),
+                    "lambda_mult": search_kwargs_for_retriever.get("lambda_mult", 0.5),
+                    "k": search_kwargs_for_retriever.get("k", 4) # Final k for MMR
+                }
+                
+                # The LangChain MMR retriever will perform its own similarity search internally
+                # to calculate diversity, but we've already done the initial relevance filtering.
+                # To apply MMR to our *already filtered* set, we need to manually implement MMR logic
+                # or use a re-ranker.
+                
+                # For now, to avoid passing score_threshold to LangChain's MMR retriever,
+                # and to ensure the score_threshold is respected, we'll use the filtered
+                # similarity results and then apply a *manual* MMR selection from them.
+                
+                # This is a manual MMR selection from the `temp_docs_with_scores` (which are already filtered by score_threshold)
+                selected_indices = []
+                remaining_indices = list(range(len(temp_docs_with_scores)))
+                
+                k_mmr = retriever_settings.get("k", 4)
+                lambda_mult_mmr = retriever_settings.get("lambda_mult", 0.5)
+
+                if not remaining_indices:
+                    _log_debug("No documents to apply MMR to after initial filtering.")
+                else:
+                    # Get query embedding once
+                    embeddings_model = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+                    query_embedding = embeddings_model.embed_query(query_text_for_llm)
+                    
+                    # Extract document embeddings for MMR calculation
+                    doc_embeddings = [embeddings_model.embed_query(doc.page_content) for doc, _ in temp_docs_with_scores]
+
+                    # Select the first document based on highest relevance to query
+                    initial_relevance_scores = [
+                        embeddings_model.similarity([query_embedding], [doc_embed])[0]
+                        for doc_embed in doc_embeddings
+                    ]
+                    
+                    best_idx = initial_relevance_scores.index(max(initial_relevance_scores))
+                    selected_indices.append(best_idx)
+                    remaining_indices.remove(best_idx)
+
+                    for _ in range(min(k_mmr - 1, len(remaining_indices))):
+                        mmr_scores = []
+                        for i in remaining_indices:
+                            relevance_score = embeddings_model.similarity([query_embedding], [doc_embeddings[i]])[0]
+                            
+                            diversity_scores = [
+                                embeddings_model.similarity([doc_embeddings[i]], [doc_embeddings[j]])[0]
+                                for j in selected_indices
+                            ]
+                            diversity_score = max(diversity_scores) if diversity_scores else 0 
+                            
+                            # LangChain-like MMR formula: (1 - lambda_mult) * relevance - lambda_mult * max_similarity_to_selected
+                            mmr_score = (1 - lambda_mult_mmr) * relevance_score - lambda_mult_mmr * diversity_score
+                            mmr_scores.append(mmr_score)
+                        
+                        if mmr_scores:
+                            best_idx_in_remaining = remaining_indices[mmr_scores.index(max(mmr_scores))]
+                            selected_indices.append(best_idx_in_remaining)
+                            remaining_indices.remove(best_idx_in_remaining)
+                        else:
+                            break 
+                
+                # Add the MMR selected documents (with their original scores)
+                all_retrieved_docs_with_scores.extend([temp_docs_with_scores[i] for i in selected_indices])
+
+            else: # If search_type is similarity or no MMR re-ranking, just add the filtered docs
+                all_retrieved_docs_with_scores.extend(temp_docs_with_scores)
+                
+        else:
+            print(f"  Knowledge base '{kb_name}' not loaded. Skipping.")
+
+    # Final filtering to ensure only 'k' documents are passed to LLM, if not MMR
+    # If MMR was applied, `all_retrieved_docs_with_scores` already contains the MMR-selected `k` docs.
+    # If similarity, it might contain more than `k` if `fetch_k` was used and not explicitly trimmed.
+    final_retrieved_docs = []
+    if search_type == "mmr":
+        # We already added MMR-selected docs to all_retrieved_docs_with_scores
+        # Need to ensure unique documents and limit to k_mmr
+        unique_docs_map = {}
+        for doc, score in all_retrieved_docs_with_scores:
+            if doc.page_content not in unique_docs_map: # Simple uniqueness check
+                unique_docs_map[doc.page_content] = doc
+        final_retrieved_docs = list(unique_docs_map.values())[:retriever_settings.get("k", 4)]
+        _log_debug(f"MMR final selected {len(final_retrieved_docs)} documents.")
+    else:
+        # For similarity, just take the top 'k' from the already score-filtered list
+        unique_docs_map = {}
+        for doc, score in all_retrieved_docs_with_scores:
+            if doc.page_content not in unique_docs_map: # Simple uniqueness check
+                unique_docs_map[doc.page_content] = doc
+        final_retrieved_docs = list(unique_docs_map.values())[:retriever_settings.get("k", 4)]
+        _log_debug(f"Similarity search final selected {len(final_retrieved_docs)} documents.")
+
+
+    if not final_retrieved_docs:
+        llm_response_generator = iter(["No relevant documents found in the selected knowledge base(s) for your query."])
         # If no documents are found, LLM can still draw on general knowledge
         messages_for_llm = [
             {"role": "system", "content": SYSTEM_INSTRUCTION_PROMPT},
             {"role": "user", "content": f"Question: {original_query_text}\nAnswer:"}
         ]
-        llm_response_content += "\n" + "".join([chunk.content for chunk in llm.stream(messages_for_llm)])
-        return llm_response_content, []
+        general_knowledge_generator = llm.stream(messages_for_llm)
+        
+        def combined_generator():
+            yield "Drawing on general knowledge: "
+            for chunk in general_knowledge_generator:
+                if chunk.content:
+                    yield chunk.content
+        
+        return combined_generator(), []
     else:
         context_parts = []
-        for doc in retrieved_docs:
+        for doc in final_retrieved_docs:
             source_info = doc.metadata.get("source", "Unknown Source")
             original_title = doc.metadata.get("original_title")
             title_part = f", Title: {original_title}" if original_title else ""
-            context_parts.append(f"Source: {source_info}{title_part}\nContent: {doc.page_content}")
+            context_parts.append(f"--- DOCUMENT START ---\nSource: {source_info}{title_part}\nContent: {doc.page_content}\n--- DOCUMENT END ---")
         context_str = "\n\n".join(context_parts)
         
+        _log_debug(f"context_parts = {context_parts}")
+        _log_debug(f"context_str   = {context_str}")
         user_query_content = f"""Context:
 {context_str}
 
 Question: {original_query_text} 
-
-Please summarize the information in the provided context, identifying and creating distinct, relevant sections based on the content. Provide key points under each section in bullet points. If information for a category is not found, you can omit that category or state that the information is not available in the document.
 
 Answer:"""
         messages_for_llm = [
@@ -838,12 +1074,9 @@ Answer:"""
             {"role": "user", "content": user_query_content}
         ]
 
-        llm_response_content = ""
-        for chunk in llm.stream(messages_for_llm):
-            if chunk.content:
-                llm_response_content += chunk.content
+        llm_response_generator = (chunk.content for chunk in llm.stream(messages_for_llm)) # Yield content directly
         
-        return llm_response_content, retrieved_docs
+        return llm_response_generator, final_retrieved_docs
 
 # New debug function to inspect ChromaDB content directly
 def debug_chroma_content(vectorstore, filter_site_origin):
@@ -885,15 +1118,24 @@ def debug_chroma_content(vectorstore, filter_site_origin):
     return debug_docs
 
 
-def initialize_rag_system(ui_config):
+def initialize_rag_system(ui_config, response_queue: queue.Queue):
     """
     Initializes the RAG system components: Llamafile server, LLM, and knowledge bases.
-    Accepts ui_config to load prompts.
-    Returns (llm_instance, knowledge_bases, llamafile_process).
+    Accepts ui_config to load prompts and retriever settings, and response_queue for progress.
+    Returns (llm_instance, knowledge_bases, llamafile_process, retriever_settings, debug_logging_enabled).
     """
-    global _llm_instance, _knowledge_bases, _llamafile_process, EXECUTIVE_SUMMARY_PROMPT, SYSTEM_INSTRUCTION_PROMPT # Declare globals here
+    global _llm_instance, _knowledge_bases, _llamafile_process, _retriever_settings, \
+           _debug_logging_enabled, EXECUTIVE_SUMMARY_PROMPT, SYSTEM_INSTRUCTION_PROMPT # Declare globals here
 
     print("[app.py] Initializing RAG system (this may take a moment)...")
+
+    # Load debug settings
+    if 'debug_settings' in ui_config:
+        _debug_logging_enabled = ui_config['debug_settings'].get('enable_debug_logging', False)
+        print(f"[app.py] Debug logging is {'enabled' if _debug_logging_enabled else 'disabled'} from config.yaml.")
+    else:
+        print("[app.py] Warning: 'debug_settings' section not found in config.yaml. Debug logging disabled by default.")
+        _debug_logging_enabled = False
 
     # Load prompts from ui_config
     if 'llm_prompts' in ui_config:
@@ -903,12 +1145,37 @@ def initialize_rag_system(ui_config):
     else:
         print("[app.py] Warning: 'llm_prompts' section not found in config.yaml. Using default hardcoded prompts.")
 
+    # Load retriever settings from ui_config
+    if 'retriever_settings' in ui_config:
+        _retriever_settings = ui_config['retriever_settings']
+        print("[app.py] Retriever settings loaded from config.yaml.")
+    else:
+        print("[app.py] Warning: 'retriever_settings' section not found in config.yaml. Using default retriever settings.")
+        _retriever_settings = {
+            "search_type": "similarity",
+            "k": 4,
+            "fetch_k": 20, # Only relevant for MMR
+            "lambda_mult": 0.5, # Only relevant for MMR
+            "score_threshold": None # No score threshold by default
+        }
+    _log_debug(f"Active Retriever Settings: {_retriever_settings}")
+
+    # Load progress bar settings
+    total_steps = ui_config.get('progress_bar_settings', {}).get('total_initialization_steps', 10)
+    current_step = [0] # Use a list to allow modification within nested functions
+
+    def update_progress(stage_name: str):
+        current_step[0] += 1
+        percentage = int((current_step[0] / total_steps) * 100)
+        response_queue.put({"type": "init_progress", "stage": stage_name, "percentage": percentage})
+        print(f"[app.py] Progress: {stage_name} ({percentage}%)") # Keep console print for server side visibility
 
     # Start Llamafile server
-    _llamafile_process, llama_startup_error = start_llamafile_server()
+    update_progress("Starting Llamafile server")
+    _llamafile_process, llama_startup_error = start_llamafile_server(response_queue, current_step, total_steps)
     if llama_startup_error:
         print(f"[app.py] Fatal error during Llamafile server startup: {llama_startup_error}")
-        return None, None, None
+        return None, None, None, None, _debug_logging_enabled
 
     # Ensure all specialized data directories exist
     BASE_DATA_DIR.mkdir(exist_ok=True)
@@ -930,58 +1197,78 @@ def initialize_rag_system(ui_config):
     print("-----------------------------\n")
 
     # Load knowledge bases
-    print(f"Loading documents and initializing vector store for '{MISC_DIR.name}'...")
+    update_progress(f"Loading '{MISC_DIR.name}' documents")
     misc_docs = load_documents_from_directory(MISC_DIR)
-    misc_vectorstore = initialize_vector_store_for_category(misc_docs, MISC_DIR.name)
+    misc_vectorstore = initialize_vector_store_for_category(
+        misc_docs, MISC_DIR.name, 
+        text_splitter_params=_retriever_settings.get("text_splitter", {})
+    )
     if misc_vectorstore:
         _knowledge_bases['misc'] = misc_vectorstore
     
-    print(f"\nLoading documents and initializing vector store for '{SEC_DIR.name}'...")
+    update_progress(f"Loading '{SEC_DIR.name}' documents")
     sec_docs = load_documents_from_directory(SEC_DIR)
-    sec_vectorstore = initialize_vector_store_for_category(sec_docs, SEC_DIR.name)
+    sec_vectorstore = initialize_vector_store_for_category(
+        sec_docs, SEC_DIR.name, 
+        text_splitter_params=_retriever_settings.get("text_splitter", {})
+    )
     if sec_vectorstore:
         _knowledge_bases['sec'] = sec_vectorstore
 
-    print(f"\nLoading documents and initializing vector store for '{LEGAL_DIR.name}'...")
+    update_progress(f"Loading '{LEGAL_DIR.name}' documents")
     legal_docs = load_documents_from_directory(LEGAL_DIR)
-    legal_vectorstore = initialize_vector_store_for_category(legal_docs, LEGAL_DIR.name)
+    legal_vectorstore = initialize_vector_store_for_category(
+        legal_docs, LEGAL_DIR.name, 
+        text_splitter_params=_retriever_settings.get("text_splitter", {})
+    )
     if legal_vectorstore:
         _knowledge_bases['legal'] = legal_vectorstore
 
-    print(f"\nLoading documents and initializing vector store for '{NEWS_DIR.name}' (full articles)...")
+    update_progress(f"Loading '{NEWS_DIR.name}' full articles")
     news_full_docs = load_documents_from_directory(NEWS_DIR, load_summaries=False)
-    news_full_vectorstore = initialize_vector_store_for_category(news_full_docs, NEWS_DIR.name, use_summaries=False)
+    news_full_vectorstore = initialize_vector_store_for_category(
+        news_full_docs, NEWS_DIR.name, use_summaries=False,
+        text_splitter_params=_retriever_settings.get("text_splitter", {})
+    )
     if news_full_vectorstore:
         _knowledge_bases['news_full'] = news_full_vectorstore
 
-    print(f"\nLoading documents and initializing vector store for '{NEWS_SUMMARIES_KB_NAME}' (summaries)...")
+    update_progress(f"Loading '{NEWS_SUMMARIES_KB_NAME}' summaries")
     news_summary_docs = load_documents_from_directory(NEWS_DIR, load_summaries=True, summary_kb_name=NEWS_SUMMARIES_KB_NAME) 
-    news_summary_vectorstore = initialize_vector_store_for_category(news_summary_docs, NEWS_SUMMARIES_KB_NAME, use_summaries=True)
+    news_summary_vectorstore = initialize_vector_store_for_category(
+        news_summary_docs, NEWS_SUMMARIES_KB_NAME, use_summaries=True
+    ) 
     if news_summary_vectorstore:
         _knowledge_bases[NEWS_SUMMARIES_KB_NAME] = news_summary_vectorstore
 
-    print(f"\nLoading documents and initializing vector store for '{BLOG_SUMMARIES_KB_NAME}' (summaries)...")
+    update_progress(f"Loading '{BLOG_SUMMARIES_KB_NAME}' summaries")
     blog_summary_docs = load_documents_from_directory(BLOG_DIR, load_summaries=True, summary_kb_name=BLOG_SUMMARIES_KB_NAME) 
-    blog_summary_vectorstore = initialize_vector_store_for_category(blog_summary_docs, BLOG_SUMMARIES_KB_NAME, use_summaries=True)
+    blog_summary_vectorstore = initialize_vector_store_for_category(
+        blog_summary_docs, BLOG_SUMMARIES_KB_NAME, use_summaries=True
+    )
     if blog_summary_vectorstore:
         _knowledge_bases[BLOG_SUMMARIES_KB_NAME] = blog_summary_vectorstore
 
-    print(f"\nLoading documents and initializing vector store for '{SOCIAL_MEDIA_SUMMARIES_KB_NAME}' (summaries)...")
+    update_progress(f"Loading '{SOCIAL_MEDIA_SUMMARIES_KB_NAME}' summaries")
     social_media_summary_docs = load_documents_from_directory(SOCIAL_MEDIA_DIR, load_summaries=True, summary_kb_name=SOCIAL_MEDIA_SUMMARIES_KB_NAME) 
-    social_media_summary_vectorstore = initialize_vector_store_for_category(social_media_summary_docs, SOCIAL_MEDIA_SUMMARIES_KB_NAME, use_summaries=True)
+    social_media_summary_vectorstore = initialize_vector_store_for_category(
+        social_media_summary_docs, SOCIAL_MEDIA_SUMMARIES_KB_NAME, use_summaries=True
+    )
     if social_media_summary_vectorstore:
         _knowledge_bases[SOCIAL_MEDIA_SUMMARIES_KB_NAME] = social_media_summary_vectorstore
 
 
     if not _knowledge_bases:
         print("\nNo active knowledge bases found. Please ensure documents are in the correct 'data' subfolders and try again.")
+        response_queue.put({"type": "init_progress", "stage": "No knowledge bases loaded", "percentage": 100})
         if _llamafile_process and isinstance(_llamafile_process, subprocess.Popen):
             _llamafile_process.terminate()
-        return None, None, None
+        return None, None, None, None, _debug_logging_enabled
 
     print(f"\nSuccessfully loaded {len(_knowledge_bases)} knowledge bases: {', '.join(_knowledge_bases.keys())}")
 
     # Initialize LLM
+    update_progress("Connecting to LLM")
     print(f"Connecting to LLM via llamafile at {LLAMAFILE_API_BASE}...")
     try:
         _llm_instance = ChatOpenAI(
@@ -994,38 +1281,38 @@ def initialize_rag_system(ui_config):
         )
         _llm_instance.invoke("Hello", max_tokens=10) # Test connection
         print("LLM (via llamafile) initialized successfully!")
+        update_progress("LLM initialized")
     except Exception as e:
         print(f"Error connecting to llamafile LLM at {LLAMAFILE_API_BASE}.")
         print(f"Error details: {e}")
         print(f"Please ensure '{LLAMAFILE_NAME}' is running in server mode and reachable at {LLAMAFILE_API_BASE}.")
+        response_queue.put({"type": "init_progress", "stage": f"LLM connection failed: {e}", "percentage": 100})
         if _llamafile_process and isinstance(_llamafile_process, subprocess.Popen):
             _llamafile_process.terminate()
-        return None, None, None
+        return None, None, None, None, _debug_logging_enabled
     
-    return _llm_instance, _knowledge_bases, _llamafile_process
+    return _llm_instance, _knowledge_bases, _llamafile_process, _retriever_settings, _debug_logging_enabled
 
 # --- Debug print for module loading ---
 print(f"[app.py] Module loaded. initialize_rag_system is defined: {'initialize_rag_system' in globals()}")
 
 # --- Main execution block for app.py (now minimal) ---
 if __name__ == "__main__":
-    # This block is for direct execution of app.py for testing its initialization
-    # In a real setup, web_ui.py would import and call initialize_rag_system()
     print("This app.py is now designed as a backend module.")
     print("Please run `web_ui.py` to interact with the application.")
     
-    # You can uncomment the following lines for manual testing of app.py's initialization
-    # and then manually inspect the _llm_instance, _knowledge_bases objects.
-    # _llm_instance, _knowledge_bases, _llamafile_process = initialize_rag_system()
-    # if _llm_instance and _knowledge_bases:
-    #     print("RAG system initialized successfully for direct app.py test.")
-    # else:
-    #     print("RAG system initialization failed during direct app.py test.")
-    # input("Press Enter to exit (and terminate Llamafile if started by this script)...")
-    # if _llamafile_process and isinstance(_llamafile_process, subprocess.Popen):
+    # Example of how to manually test initialization with a dummy queue
+    # if you want to run app.py directly for debugging purposes.
+    # dummy_queue = queue.Queue()
+    # llm, kbs, proc, r_settings, debug_enabled = initialize_rag_system({}, dummy_queue)
+    # print("\n--- Debugging Queue Content ---")
+    # while not dummy_queue.empty():
+    #     print(dummy_queue.get())
+    # print("-----------------------------")
+    # if proc and isinstance(proc, subprocess.Popen):
     #     print("Terminating Llamafile server from direct app.py exit.")
-    #     _llamafile_process.terminate()
-    #     _llamafile_process.wait(timeout=5)
-    #     if _llamafile_process.poll() is None:
-    #         _llamafile_process.kill()
+    #     proc.terminate()
+    #     proc.wait(timeout=5)
+    #     if proc.poll() is None:
+    #         proc.kill()
 

@@ -3,216 +3,302 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ ui_config.ui_settings.app_title | default('RAG Summarizer') }}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <title>{{ ui_config.ui_settings.app_title | default('My Personalized RAG Summarizer') }}</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
-        /* Dynamic CSS variables from config.yaml */
-        :root {
-            --bg-image-url: {% if ui_config.ui_settings.background.type == 'image' %}url("{{ ui_config.ui_settings.background.value }}"){% else %}none{% endif %};
-            --bg-color-fallback: {{ ui_config.ui_settings.background.value if ui_config.ui_settings.background.type == 'color' else '#1a1a1a' }};
-            
-            --window-opacity: {{ ui_config.ui_settings.windows.common.opacity | default(0.85) }};
-            --window-bg-color: {{ ui_config.ui_settings.windows.common.background_color_fallback | default('rgba(0, 0, 0, 0.7)') }};
-            --window-border-radius: {{ ui_config.ui_settings.windows.common.border_radius | default('10px') }};
-            --window-padding: {{ ui_config.ui_settings.windows.common.padding | default('20px') }};
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #1a1a1a; /* Fallback for background color */
+            {% if ui_config.ui_settings.background.type == 'image' and ui_config.ui_settings.background.value %}
+            background-image: url('{{ ui_config.ui_settings.background.value }}');
+            background-size: cover;
+            background-position: center;
+            background-attachment: fixed;
+            {% elif ui_config.ui_settings.background.type == 'local_image' and ui_config.ui_settings.background.value %}
+            /* Assuming local images are in a 'static' folder, e.g., static/images/terminal1.png */
+            background-image: url('{{ url_for('static', filename=ui_config.ui_settings.background.value) }}');
+            background-size: cover;
+            background-position: center;
+            background-attachment: fixed;
+            {% elif ui_config.ui_settings.background.type == 'color' and ui_config.ui_settings.background.value %}
+            background-color: {{ ui_config.ui_settings.background.value }};
+            {% endif %}
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+        }
 
-            --input-text-color: {{ ui_config.ui_settings.windows.input_window.text_color | default('#FFFFFF') }};
-            --input-placeholder-color: {{ ui_config.ui_settings.windows.input_window.placeholder_color | default('rgba(255, 255, 255, 0.6)') }};
+        /* Common window styling */
+        .rag-window {
+            background-color: {{ ui_config.ui_settings.windows.common.background_color_fallback | default('rgba(0, 0, 0, 0.7)') }};
+            border-radius: {{ ui_config.ui_settings.windows.common.border_radius | default('10px') }};
+            padding: {{ ui_config.ui_settings.windows.common.padding | default('20px') }};
+            opacity: {{ ui_config.ui_settings.windows.common.opacity | default('0.85') }};
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.5);
+        }
 
-            --llm-text-color: {{ ui_config.ui_settings.windows.llm_response_window.text_color | default('#E0FFFF') }};
-            --llm-font-size: {{ ui_config.ui_settings.windows.llm_response_window.font_size | default('16px') }};
-            --llm-line-height: {{ ui_config.ui_settings.windows.llm_response_window.line_height | default('1.6') }};
+        /* Specific window styling overrides */
+        #input-window {
+            color: {{ ui_config.ui_settings.windows.input_window.text_color | default('#FFFFFF') }};
+        }
+        #query-input::placeholder {
+            color: {{ ui_config.ui_settings.windows.input_window.placeholder_color | default('rgba(255, 255, 255, 0.6)') }};
+        }
+        #llm-response-window {
+            color: {{ ui_config.ui_settings.windows.llm_response_window.text_color | default('#E0FFFF') }};
+            font-size: {{ ui_config.ui_settings.windows.llm_response_window.font_size | default('16px') }};
+            line-height: {{ ui_config.ui_settings.windows.llm_response_window.line_height | default('1.6') }};
+        }
+        #references-window {
+            color: {{ ui_config.ui_settings.windows.references_window.text_color | default('#ADD8E6') }};
+            font-size: {{ ui_config.ui_settings.windows.references_window.font_size | default('14px') }};
+            line-height: {{ ui_config.ui_settings.windows.references_window.line_height | default('1.4') }};
+        }
 
-            --references-text-color: {{ ui_config.ui_settings.windows.references_window.text_color | default('#ADD8E6') }};
-            --references-font-size: {{ ui_config.ui_settings.windows.references_window.font_size | default('14px') }};
-            --references-line-height: {{ ui_config.ui_settings.windows.references_window.line_height | default('1.4') }};
-
-            /* Colors for content within the LLM/References output (from config.yaml) */
-            --color-prompt-text: {{ ui_config.ui_settings.colors.prompt_text | default('#FFFF00') }};
-            --color-ai-stream-text: {{ ui_config.ui_settings.colors.ai_stream_text | default('#87CEEB') }};
-            --color-title-text: {{ ui_config.ui_settings.colors.title_text | default('#FF8C00') }};
-            --color-summary-text: {{ ui_config.ui_settings.colors.summary_text | default('#B0E0E6') }};
+        /* Custom scrollbar for content windows */
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 8px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.3);
+            border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.5);
         }
     </style>
 </head>
-<body>
-    <div class="container">
-        <h1>{{ ui_config.ui_settings.app_title | default('RAG Summarizer') }}</h1>
-        
-        <div id="init-status" class="status-message">Initializing RAG system... Please wait.</div>
+<body class="flex flex-col items-center justify-center min-h-screen p-4">
 
-        <div class="window input-window">
-            <input type="text" id="query-input" placeholder="Type your query here (e.g., get headlines today from cnn.com)" autofocus>
-            <button id="submit-button">Submit</button>
+    <!-- Initialization Progress Bar -->
+    <div id="initialization-status" class="fixed inset-0 bg-gray-900 bg-opacity-90 flex items-center justify-center z-50">
+        <div class="bg-gray-800 p-8 rounded-lg shadow-xl max-w-md w-full text-center">
+            <p id="progress-text" class="text-xl font-semibold text-white mb-4">Initializing RAG System...</p>
+            <div class="w-full bg-gray-700 rounded-full h-3">
+                <div id="progress-bar" class="bg-blue-500 h-3 rounded-full transition-all duration-300 ease-out" style="width: 0%;"></div>
+            </div>
+            <p class="text-sm text-gray-400 mt-2">Please wait while the AI backend loads.</p>
+        </div>
+    </div>
+
+    <!-- Main Application Content (Initially Hidden) -->
+    <div id="main-app-content" class="container mx-auto grid grid-cols-1 lg:grid-cols-2 gap-6 w-full max-w-6xl" style="display: none;">
+        <!-- Application Title -->
+        <h1 class="text-5xl font-extrabold text-white text-center mb-6 lg:col-span-2">
+            {{ ui_config.ui_settings.app_title | default('My Personalized RAG Summarizer') }}
+        </h1>
+
+        <!-- Input Window -->
+        <div id="input-window" class="rag-window flex flex-col h-full lg:col-span-2">
+            <h2 class="text-2xl font-bold mb-4 text-orange-400">Ask Your Documents</h2>
+            <textarea id="query-input"
+                      class="w-full p-3 bg-gray-700 rounded-md border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500 mb-4 resize-y text-white custom-scrollbar"
+                      rows="4"
+                      placeholder="e.g., MISC:LEGAL: how much stock does Concely del Carmen Mendez Rojas supposedly own in Visa Stock?"></textarea>
+            <button id="submit-query"
+                    class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-md transition duration-300 ease-in-out transform hover:scale-105 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-75">
+                Submit Query
+            </button>
         </div>
 
-        <div class="output-windows">
-            <div class="window llm-response-window">
-                <h2>LLM Response</h2>
-                <pre id="llm-response-output" class="llm-response"></pre>
+        <!-- LLM Response Window -->
+        <div id="llm-response-window" class="rag-window flex flex-col h-96 overflow-auto custom-scrollbar">
+            <h2 class="text-2xl font-bold mb-4 text-sky-400">LLM Response</h2>
+            <div id="llm-response-content" class="flex-grow text-gray-200 whitespace-pre-wrap">
+                Your AI assistant's response will appear here.
             </div>
+        </div>
 
-            <div class="window references-window">
-                <h2>Referenced Articles / Thinking Process</h2>
-                <pre id="references-output" class="references-output"></pre>
+        <!-- References Window -->
+        <div id="references-window" class="rag-window flex flex-col h-96 overflow-auto custom-scrollbar">
+            <h2 class="text-2xl font-bold mb-4 text-blue-300">References</h2>
+            <div id="references-content" class="flex-grow text-gray-300">
+                Sources will be listed here.
             </div>
         </div>
     </div>
 
     <script>
-        const queryInput = document.getElementById('query-input');
-        const submitButton = document.getElementById('submit-button');
-        const llmOutput = document.getElementById('llm-response-output');
-        const referencesOutput = document.getElementById('references-output');
-        const initStatus = document.getElementById('init-status');
+        document.addEventListener('DOMContentLoaded', function() {
+            const initStatusDiv = document.getElementById('initialization-status');
+            const progressText = document.getElementById('progress-text');
+            const progressBar = document.getElementById('progress-bar');
+            const mainAppContent = document.getElementById('main-app-content');
+            const queryInput = document.getElementById('query-input');
+            const submitQueryButton = document.getElementById('submit-query');
+            const llmResponseContent = document.getElementById('llm-response-content');
+            const referencesContent = document.getElementById('references-content');
 
-        let isStreaming = false;
-        let rag_system_initialized = false; 
-
-        function escapeHtml(text) {
-            return text
-                .replace(/&/g, "&amp;")
-                .replace(/</g, "&lt;")
-                .replace(/>/g, "&gt;")
-                .replace(/"/g, "&quot;")
-                .replace(/'/g, "&#039;");
-        }
-
-        function applyAnsiColors(text) {
-            text = text.replace(/\x1b\[1;33m/g, '<span style="color: var(--color-prompt-text);">'); // Yellow
-            text = text.replace(/\x1b\[38;5;208m/g, '<span style="color: var(--color-title-text);">'); // Orange
-            text = text.replace(/\x1b\[94m/g, '<span style="color: var(--color-summary-text);">'); // Light Blue
-            text = text.replace(/\x1b\[0m/g, '</span>'); // Reset
-
-            let openSpans = (text.match(/<span/g) || []).length;
-            let closeSpans = (text.match(/<\/span>/g) || []).length;
-            for (let i = 0; i < (openSpans - closeSpans); i++) {
-                text += '</span>';
+            // Show initialization status initially
+            if (initStatusDiv) {
+                initStatusDiv.style.display = 'flex';
             }
-            return text;
-        }
 
-        const initSource = new EventSource('/stream_init_status');
-        initSource.onmessage = function(event) {
-            const data = JSON.parse(event.data);
-            if (data.type === 'init_complete') {
-                rag_system_initialized = data.success; 
-                if (data.success) {
-                    initStatus.textContent = "RAG system ready!";
-                    initStatus.style.backgroundColor = 'rgba(0, 128, 0, 0.7)'; 
-                    submitButton.disabled = false;
-                    queryInput.disabled = false;
-                } else {
-                    initStatus.textContent = "RAG system failed to initialize. " + (data.error || "");
-                    initStatus.style.backgroundColor = 'rgba(255, 0, 0, 0.7)'; 
+            const eventSource = new EventSource('/stream_init_status');
+
+            eventSource.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                console.log("Received init status:", data);
+
+                if (data.type === 'init_progress') {
+                    if (progressText) progressText.textContent = data.stage;
+                    if (progressBar) progressBar.style.width = data.percentage + '%';
+                } else if (data.type === 'init_complete') {
+                    if (data.success) {
+                        if (progressText) progressText.textContent = 'RAG System Ready! ✨';
+                        if (progressBar) {
+                            progressBar.style.width = '100%';
+                            progressBar.classList.remove('bg-blue-500');
+                            progressBar.classList.add('bg-green-500'); // Indicate success
+                        }
+                        setTimeout(() => {
+                            if (initStatusDiv) initStatusDiv.style.display = 'none'; // Hide after a delay
+                            if (mainAppContent) mainAppContent.style.display = 'grid'; // Show main app content
+                            queryInput.focus(); // Focus on the input field
+                        }, 1500);
+                    } else {
+                        if (progressText) progressText.textContent = `Initialization Failed: ${data.error || 'Unknown error'}`;
+                        if (progressBar) {
+                            progressBar.style.width = '100%';
+                            progressBar.classList.remove('bg-blue-500');
+                            progressBar.classList.add('bg-red-500'); // Indicate failure
+                        }
+                        // Keep the error message visible for longer or indefinitely
+                    }
+                    eventSource.close(); // Close the connection
                 }
-                initSource.close();
-            }
-        };
-        initSource.onerror = function(err) {
-            console.error("EventSource failed:", err);
-            initStatus.textContent = "Error connecting to init stream.";
-            initStatus.style.backgroundColor = 'rgba(255, 0, 0, 0.7)';
-            initSource.close();
-        };
+            };
 
-        async function submitQuery() {
-            if (isStreaming || !rag_system_initialized) {
-                if (!rag_system_initialized) {
-                    alert("RAG system is not initialized yet. Please wait.");
+            eventSource.onerror = function(err) {
+                console.error("EventSource failed:", err);
+                if (progressText) progressText.textContent = 'Connection to server lost. Please check server logs.';
+                if (progressBar) {
+                    progressBar.classList.remove('bg-blue-500');
+                    progressBar.classList.add('bg-red-500');
                 }
-                return;
-            }
+                eventSource.close();
+            };
 
-            const query = queryInput.value;
-            if (!query) return;
+            // --- Query Submission Logic ---
+            submitQueryButton.addEventListener('click', submitQuery);
+            queryInput.addEventListener('keypress', function(e) {
+                if (e.key === 'Enter' && !e.shiftKey) { // Submit on Enter, not Shift+Enter
+                    e.preventDefault(); // Prevent new line in textarea
+                    submitQuery();
+                }
+            });
 
-            llmOutput.innerHTML = ''; 
-            referencesOutput.innerHTML = ''; // Clear references output at the start of a new query
-            submitButton.disabled = true;
-            queryInput.disabled = true;
-            isStreaming = true;
+            function submitQuery() {
+                const query = queryInput.value.trim();
+                if (!query) {
+                    alert('Please enter a query.'); // Consider a custom modal instead of alert
+                    return;
+                }
 
-            try {
-                const response = await fetch('/query', {
+                llmResponseContent.textContent = 'Thinking...';
+                referencesContent.innerHTML = 'Retrieving sources...';
+                submitQueryButton.disabled = true; // Disable button during processing
+
+                fetch('/query', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
                     },
                     body: JSON.stringify({ query: query })
-                });
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        llmResponseContent.textContent = `Error: ${data.error}`;
+                        referencesContent.innerHTML = '';
+                        submitQueryButton.disabled = false;
+                        return;
+                    }
+                    // Start streaming the response
+                    const responseEventSource = new EventSource('/stream_response');
+                    let fullResponse = '';
+                    let citations = [];
+                    let referencedArticles = [];
 
-                if (!response.ok) {
-                    const errorData = await response.json();
-                    llmOutput.textContent = `Error: ${errorData.error || response.statusText}`;
-                    isStreaming = false;
-                    submitButton.disabled = false;
-                    queryInput.disabled = false;
-                    return;
+                    llmResponseContent.textContent = ''; // Clear initial "Thinking..."
+
+                    responseEventSource.onmessage = function(event) {
+                        const streamData = JSON.parse(event.data);
+                        if (streamData.type === 'llm_chunk') {
+                            fullResponse += streamData.content;
+                            llmResponseContent.textContent = fullResponse;
+                            // Scroll to bottom
+                            llmResponseContent.scrollTop = llmResponseContent.scrollHeight;
+                        } else if (streamData.type === 'end_stream') {
+                            citations = streamData.results.citations;
+                            referencedArticles = streamData.results.referenced_articles;
+                            displayReferences(citations, referencedArticles);
+                            submitQueryButton.disabled = false;
+                            responseEventSource.close();
+                        }
+                    };
+
+                    responseEventSource.onerror = function(err) {
+                        console.error("Response EventSource failed:", err);
+                        llmResponseContent.textContent = `Error streaming response: ${err.message || 'Connection lost.'}`;
+                        submitQueryButton.disabled = false;
+                        responseEventSource.close();
+                    };
+                })
+                .catch(error => {
+                    console.error('Error submitting query:', error);
+                    llmResponseContent.textContent = `Error: ${error.message || 'Failed to submit query.'}`;
+                    submitQueryButton.disabled = false;
+                });
+            }
+
+            function displayReferences(citations, referencedArticles) {
+                referencesContent.innerHTML = ''; // Clear previous references
+                if (citations && citations.length > 0) {
+                    const citationsHtml = citations.map((doc, index) => {
+                        const source = doc.metadata.source || 'Unknown Source';
+                        const title = doc.metadata.original_title || doc.metadata.title || 'No Title';
+                        const category = doc.metadata.category || 'N/A';
+                        const snippet = doc.page_content ? doc.page_content.substring(0, 200) + '...' : 'No snippet available.';
+                        return `
+                            <div class="mb-3 p-2 bg-gray-700 rounded-md">
+                                <p class="font-semibold text-blue-200">Source ${index + 1}: ${source}</p>
+                                <p class="text-sm text-gray-400">Category: ${category}</p>
+                                <p class="text-sm text-gray-400">Title: ${title}</p>
+                                <p class="text-xs text-gray-500">Snippet: ${snippet}</p>
+                            </div>
+                        `;
+                    }).join('');
+                    referencesContent.innerHTML += `<h3 class="text-xl font-bold mb-2 text-blue-300">Citations:</h3>${citationsHtml}`;
                 }
 
-                const source = new EventSource('/stream_response');
-                source.onmessage = function(event) {
-                    const data = JSON.parse(event.data);
-                    if (data.type === 'llm_chunk') {
-                        llmOutput.innerHTML += applyAnsiColors(escapeHtml(data.content));
-                        llmOutput.scrollTop = llmOutput.scrollHeight; 
-                    } else if (data.type === 'end_stream') {
-                        isStreaming = false;
-                        submitButton.disabled = false;
-                        queryInput.disabled = false;
-                        source.close(); 
-                        queryInput.value = ''; 
+                if (referencedArticles && referencedArticles.length > 0) {
+                    const articlesHtml = referencedArticles.map((article, index) => {
+                        return `
+                            <div class="mb-3 p-2 bg-gray-700 rounded-md">
+                                <p class="font-semibold text-blue-200">Article ${index + 1}: ${article.title}</p>
+                                <p class="text-sm text-gray-400">Site: ${article.site_origin}</p>
+                                <p class="text-xs text-gray-500">Summary: ${article.summary.substring(0, 200)}...</p>
+                            </div>
+                        `;
+                    }).join('');
+                    referencesContent.innerHTML += `<h3 class="xl font-bold mt-4 mb-2 text-blue-300">Referenced Articles:</h3>${articlesHtml}`;
+                }
 
-                        // Display referenced articles (for direct_headlines)
-                        if (data.results && data.results.referenced_articles && data.results.referenced_articles.length > 0) {
-                            referencesOutput.innerHTML = '<h3>Raw Headlines from File System:</h3>';
-                            data.results.referenced_articles.forEach((item, index) => {
-                                referencesOutput.innerHTML += `<p>${index + 1}. <span style="color: var(--color-prompt-text);">Title:</span> <span style="color: var(--color-title-text);">${escapeHtml(item.title)}</span> <span style="color: var(--color-prompt-text);">Summary:</span> <span style="color: var(--color-summary-text);">${escapeHtml(item.summary)}</span><br>(Source: ${escapeHtml(item.source)}, Site: ${escapeHtml(item.site_origin)})</p><hr>`;
-                            });
-                        } 
-                        // Display citations (for other RAG queries)
-                        else if (data.results && data.results.citations && data.results.citations.length > 0) {
-                            referencesOutput.innerHTML = '<h3>Referenced Documents (from ChromaDB):</h3>';
-                            data.results.citations.forEach((doc, index) => {
-                                const sourceName = escapeHtml(doc.metadata.source || 'N/A');
-                                const originalTitle = escapeHtml(doc.metadata.original_title || 'N/A');
-                                const contentSnippet = escapeHtml(doc.page_content ? doc.page_content.substring(0, 200) + '...' : 'No content snippet available');
-                                
-                                referencesOutput.innerHTML += `<p>${index + 1}. <span style="color: var(--color-prompt-text);">Source:</span> ${sourceName} <span style="color: var(--color-prompt-text);">Title:</span> <span style="color: var(--color-title-text);">${originalTitle}</span><br><span style="color: var(--color-prompt-text);">Content Snippet:</span> <span style="color: var(--color-summary-text);">${contentSnippet}</span></p><hr>`;
-                            });
-                        } else {
-                            referencesOutput.innerHTML = '<p>No specific articles or documents referenced.</p>';
-                        }
-                        referencesOutput.scrollTop = referencesOutput.scrollHeight; 
-                    }
-                };
-                source.onerror = function(err) {
-                    console.error("EventSource failed:", err);
-                    llmOutput.textContent += "\nError receiving streamed response.";
-                    isStreaming = false;
-                    submitButton.disabled = false;
-                    queryInput.disabled = false;
-                    source.close();
-                };
-
-            } catch (error) {
-                llmOutput.textContent = `Network Error: ${error.message}`;
-                isStreaming = false;
-                submitButton.disabled = false;
-                queryInput.disabled = false;
-            }
-        }
-
-        submitButton.addEventListener('click', submitQuery);
-        queryInput.addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                submitQuery();
+                if (citations.length === 0 && referencedArticles.length === 0) {
+                    referencesContent.innerHTML = '<p class="text-gray-400">No specific references found for this query.</p>';
+                }
             }
         });
-
-        submitButton.disabled = true;
-        queryInput.disabled = true;
     </script>
 </body>
 </html>
