@@ -30,7 +30,7 @@
             align-items: center;
             min-height: 100vh;
             margin: 0;
-            padding: 20px;
+            /* Padding from body is now handled by px-4/10/20 and py-4 on body itself */
         }
 
         /* Common window styling */
@@ -40,6 +40,8 @@
             padding: {{ ui_config.ui_settings.windows.common.padding | default('20px') }};
             opacity: {{ ui_config.ui_settings.windows.common.opacity | default('0.85') }};
             box-shadow: 0 4px 10px rgba(0, 0, 0, 0.5);
+            display: flex; /* Ensure flex for internal content alignment */
+            flex-direction: column; /* Stack children vertically */
         }
 
         /* Specific window styling overrides */
@@ -49,12 +51,13 @@
         #query-input::placeholder {
             color: {{ ui_config.ui_settings.windows.input_window.placeholder_color | default('rgba(255, 255, 255, 0.6)') }};
         }
-        #llm-response-window {
+        /* Target the inner content div for styling and scrolling */
+        #llm-response-window .window-content { 
             color: {{ ui_config.ui_settings.windows.llm_response_window.text_color | default('#E0FFFF') }};
             font-size: {{ ui_config.ui_settings.windows.llm_response_window.font_size | default('16px') }};
             line-height: {{ ui_config.ui_settings.windows.llm_response_window.line_height | default('1.6') }};
         }
-        #references-window {
+        #references-window .window-content { 
             color: {{ ui_config.ui_settings.windows.references_window.text_color | default('#ADD8E6') }};
             font-size: {{ ui_config.ui_settings.windows.references_window.font_size | default('14px') }};
             line-height: {{ ui_config.ui_settings.windows.references_window.line_height | default('1.4') }};
@@ -77,7 +80,7 @@
         }
     </style>
 </head>
-<body class="flex flex-col items-center justify-center min-h-screen p-4">
+<body class="flex flex-col items-center justify-center min-h-screen px-4 lg:px-10 xl:px-20 py-4">
 
     <!-- Initialization Progress Bar -->
     <div id="initialization-status" class="fixed inset-0 bg-gray-900 bg-opacity-90 flex items-center justify-center z-50">
@@ -91,14 +94,14 @@
     </div>
 
     <!-- Main Application Content (Initially Hidden) -->
-    <div id="main-app-content" class="container mx-auto grid grid-cols-1 lg:grid-cols-2 gap-6 w-full max-w-6xl" style="display: none;">
+    <div id="main-app-content" class="container mx-auto flex flex-col gap-6 w-full max-w-7xl h-[calc(100vh-32px)]" style="display: none;">
         <!-- Application Title -->
-        <h1 class="text-5xl font-extrabold text-white text-center mb-6 lg:col-span-2">
+        <h1 class="text-5xl font-extrabold text-white text-center mb-6">
             {{ ui_config.ui_settings.app_title | default('My Personalized RAG Summarizer') }}
         </h1>
 
         <!-- Input Window -->
-        <div id="input-window" class="rag-window flex flex-col h-full lg:col-span-2">
+        <div id="input-window" class="rag-window flex-shrink-0">
             <h2 class="text-2xl font-bold mb-4 text-orange-400">Ask Your Documents</h2>
             <textarea id="query-input"
                       class="w-full p-3 bg-gray-700 rounded-md border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500 mb-4 resize-y text-white custom-scrollbar"
@@ -110,19 +113,22 @@
             </button>
         </div>
 
-        <!-- LLM Response Window -->
-        <div id="llm-response-window" class="rag-window flex flex-col h-96 overflow-auto custom-scrollbar">
-            <h2 class="text-2xl font-bold mb-4 text-sky-400">LLM Response</h2>
-            <div id="llm-response-content" class="flex-grow text-gray-200 whitespace-pre-wrap">
-                Your AI assistant's response will appear here.
+        <!-- Response and References Container -->
+        <div class="flex-grow grid grid-cols-1 lg:grid-cols-2 gap-6 min-h-0">
+            <!-- LLM Response Window -->
+            <div id="llm-response-window" class="rag-window flex-grow min-h-0">
+                <h2 class="text-2xl font-bold mb-4 text-sky-400">LLM Response</h2>
+                <div id="llm-response-content" class="window-content flex-grow text-gray-200 whitespace-pre-wrap overflow-auto custom-scrollbar">
+                    Your AI assistant's response will appear here.
+                </div>
             </div>
-        </div>
 
-        <!-- References Window -->
-        <div id="references-window" class="rag-window flex flex-col h-96 overflow-auto custom-scrollbar">
-            <h2 class="text-2xl font-bold mb-4 text-blue-300">References</h2>
-            <div id="references-content" class="flex-grow text-gray-300">
-                Sources will be listed here.
+            <!-- References Window -->
+            <div id="references-window" class="rag-window flex-grow min-h-0">
+                <h2 class="text-2xl font-bold mb-4 text-blue-300">References</h2>
+                <div id="references-content" class="window-content flex-grow text-gray-300 overflow-auto custom-scrollbar">
+                    Sources will be listed here.
+                </div>
             </div>
         </div>
     </div>
@@ -162,7 +168,7 @@
                         }
                         setTimeout(() => {
                             if (initStatusDiv) initStatusDiv.style.display = 'none'; // Hide after a delay
-                            if (mainAppContent) mainAppContent.style.display = 'grid'; // Show main app content
+                            if (mainAppContent) mainAppContent.style.display = 'flex'; // Show main app content as flex column
                             queryInput.focus(); // Focus on the input field
                         }, 1500);
                     } else {

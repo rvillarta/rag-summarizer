@@ -1,9 +1,8 @@
 ui_settings:
   app_title: "VERA"
   background:
-    type: "image" # or "color"
-    value: "static/images/spacegarden2.png"
-    # value: "#1a1a1a" # Example for solid color background (uncomment to use)
+    type: "local_image" # or "image" or "color"
+    value: "images/spacegarden2.png" # Example: static/images/terminal1.png
   windows:
     common:
       opacity: 0.85 # Float from 0.0 (fully transparent) to 1.0 (fully opaque)
@@ -19,14 +18,14 @@ ui_settings:
       line_height: "1.6"
     references_window:
       text_color: "#ADD8E6" # Light Blue
-      font_size: "14px"
+      font_size: "12px"
       line_height: "1.4"
   colors: # These are for content *within* the windows, applied by HTML/CSS
     prompt_text: "#FFFF00" # Yellow
     ai_stream_text: "#87CEEB" # Sky Blue (for LLM streamed output)
     title_text: "#FF8C00" # Dark Orange
     summary_text: "#B0E0E6" # Powder Blue
-  auto_open_browser: true # Add this line: set to true to auto-open, false to disable
+  auto_open_browser: true # Set to true to auto-open, false to disable
 
 llm_prompts:
   executive_summary_prompt: |
@@ -41,29 +40,40 @@ llm_prompts:
     Executive Summary:
   system_instruction_prompt: |
     You are a highly capable and precise assistant.
-    Your **ABSOLUTE PRIMARY OBJECTIVE** is to **DIRECTLY AND ACCURATELY ANSWER THE USER'S QUESTION** by extracting specific facts and details **EXCLUSIVELY FROM THE PROVIDED DOCUMENT(S) CONTEXT(S)**.
+    Your **ABSOLUTE PRIMARY OBJECTATIVE** is to **DIRECTLY AND ACCURATELY ANSWER THE USER'S QUESTION** by extracting specific facts and details **EXCLUSIVELY FROM THE PROVIDED DOCUMENT(S) CONTEXT(S)**.
     
     **CRITICAL AND UNYIELDING INSTRUCTIONS:**
     1.  **ANSWER DIRECTLY:** Formulate your response to directly address the user's specific question. Extract specific facts and details from the context to form your answer. Do not provide general summaries of documents unless the question explicitly asks for a summary.
     2.  **UTILIZE ALL RELEVANT CONTEXT:** Every piece of information in the provided context that is relevant to the user's question MUST be used to formulate your answer.
     4.  **NEVER, EVER DISCLAIM CONTEXT:** If a source or piece of information is present in the provided context, you **MUST** treat it as part of the provided document. You **ARE FORBIDDEN** from stating that a provided source is not part of the document.
     5.  **STRICT FALLBACK:** ONLY if the provided document context is **absolutely and entirely insufficient** to answer the question, or if the question explicitly asks for broader knowledge, preface your answer or relevant section with: "**Drawing on general knowledge:**".
-    
+    6.  **TEMPORAL FOCUS:** When discussing events, prioritize information from the most recent available documents. If a specific timeframe is not explicitly requested, assume the user is interested in past or current events. **DO NOT speculate about future events or mention dates that are significantly in the future unless they are explicitly cited from a document discussing future plans or projections.**
+
     Adhere to these instructions with utmost precision.
 
 retriever_settings:
   search_type: "similarity" # Options: "similarity", "mmr". Default is "similarity".
-  k: 4 # Number of final documents/chunks to pass to the LLM.
+  k: 100 # Number of final documents/chunks to pass to the LLM.
   fetch_k: 20 # Number of documents to fetch before applying MMR re-ranking (only used if search_type is "mmr").
   lambda_mult: 0.5 # Diversity vs. relevance trade-off for MMR (0.0 means max diversity, 1.0 means max relevance).
-  score_threshold: 0.00 # Minimum similarity score for a document/chunk to be considered. Set to None to disable.
+  score_threshold: 0.25 # Minimum similarity score for a document/chunk to be considered. Set to None to disable.
   text_splitter:
     chunk_size: 1000
     chunk_overlap: 200
 
 debug_settings:
-  enable_debug_logging: False # Set to false to disable extensive debug prints
+  enable_debug_logging: true # Set to false to disable extensive debug prints
 
 progress_bar_settings:
-  total_initialization_steps: 10 # Approximate total steps for initialization (Llamafile, LLM, KBs)
+  total_initialization_steps: 13 # Increased steps to account for Web KB and WebAgent initialization
+
+web_agent_settings: # NEW: Settings for the Web Agent
+  search_providers: ["google", "duckduckgo"] # NEW: List of search providers to use. Options: "google", "duckduckgo", "bing" (Bing requires API key).
+  max_search_results: 10 # Number of top search results to scrape from EACH provider.
+  max_scrape_retries: 2 # Number of retries for scraping a URL
+  scrape_timeout: 10 # Timeout in seconds for each scrape operation
+  web_content_retention_days: 7 # How long to keep raw scraped content files in /data/web (for cleanup, though KB is permanent)
+
+llamafile_settings: # NEW: Settings for llamafile
+  context_window_size: 16384 # Recommended for Mistral-7B-Instruct-v0.3. Adjust based on your model's actual max or your GPU VRAM.
 

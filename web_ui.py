@@ -25,6 +25,7 @@ knowledge_bases = None
 llamafile_process = None
 retriever_settings = None
 debug_logging_enabled = False
+web_agent_ready = False # NEW: Global to track WebAgent readiness
 
 # Queue for streaming LLM responses and initialization status to the frontend
 response_queue = queue.Queue()
@@ -52,21 +53,23 @@ load_config() # Load config at startup
 # --- RAG System Initialization (runs once when Flask app starts) ---
 def initialize_rag_system_thread():
     """Initializes the RAG system in a separate thread."""
-    global rag_system_initialized, llm_instance, knowledge_bases, llamafile_process, retriever_settings, debug_logging_enabled
+    global rag_system_initialized, llm_instance, knowledge_bases, llamafile_process, retriever_settings, debug_logging_enabled, web_agent_ready
     print("[web_ui.py] Initializing RAG system (this may take a moment)...")
     try:
-        llm_instance, knowledge_bases, llamafile_process, retriever_settings, debug_logging_enabled = app_backend.initialize_rag_system(ui_config, response_queue)
+        # Pass ui_config and response_queue to the backend for progress updates
+        # Unpack all six return values from app_backend.initialize_rag_system
+        llm_instance, knowledge_bases, llamafile_process, retriever_settings, debug_logging_enabled, web_agent_ready = app_backend.initialize_rag_system(ui_config, response_queue)
         
-        if llm_instance and knowledge_bases and retriever_settings:
+        if llm_instance and knowledge_bases and retriever_settings: # web_agent_ready is now checked in handle_general_query
             rag_system_initialized = True
             print("[web_ui.py] RAG system initialized successfully!")
-            response_queue.put({"type": "init_complete", "success": True, "debug_logging_enabled": debug_logging_enabled})
+            response_queue.put({"type": "init_complete", "success": True, "debug_logging_enabled": debug_logging_enabled, "web_agent_ready": web_agent_ready})
         else:
             print("[web_ui.py] RAG system initialization failed (backend returned None or incomplete).")
-            response_queue.put({"type": "init_complete", "success": False, "debug_logging_enabled": debug_logging_enabled})
+            response_queue.put({"type": "init_complete", "success": False, "debug_logging_enabled": debug_logging_enabled, "web_agent_ready": web_agent_ready})
     except Exception as e:
         print(f"[web_ui.py] Critical error during RAG system initialization: {e}")
-        response_queue.put({"type": "init_complete", "success": False, "error": str(e), "debug_logging_enabled": debug_logging_enabled})
+        response_queue.put({"type": "init_complete", "success": False, "error": str(e), "debug_logging_enabled": debug_logging_enabled, "web_agent_ready": web_agent_ready})
 
 # Start RAG system initialization in a background thread
 init_thread = threading.Thread(target=initialize_rag_system_thread)
@@ -94,10 +97,10 @@ def index():
 def stream_init_status():
     """Streams initialization status to the frontend."""
     def generate():
-        global rag_system_initialized
+        global rag_system_initialized, web_agent_ready
 
         if rag_system_initialized:
-            yield f"data: {json.dumps({'type': 'init_complete', 'success': True, 'debug_logging_enabled': debug_logging_enabled})}\n\n"
+            yield f"data: {json.dumps({'type': 'init_complete', 'success': True, 'debug_logging_enabled': debug_logging_enabled, 'web_agent_ready': web_agent_ready})}\n\n"
             return
 
         while True:
@@ -126,7 +129,7 @@ def handle_query():
             pass
 
     def process_query_thread(input_query):
-        global llm_instance, knowledge_bases, retriever_settings, debug_logging_enabled
+        global llm_instance, knowledge_bases, retriever_settings, debug_logging_enabled, web_agent_ready
         query_results = {
             "llm_response": "",
             "referenced_articles": [],
@@ -134,11 +137,11 @@ def handle_query():
         }
         
         try:
-            selected_category, original_query_text, query_text_for_llm, metadata_filter = \
+            selected_category, original_query_text, query_text_for_llm, metadata_filter, trigger_web_search = \
                 app_backend.parse_user_input(input_query, knowledge_bases.keys())
 
             if debug_logging_enabled:
-                print(f"[web_ui.py] DEBUG: selected_category={selected_category}, original_query_text='{original_query_text}', query_text_for_llm='{query_text_for_llm}', metadata_filter={metadata_filter}")
+                print(f"[web_ui.py] DEBUG: selected_category={selected_category}, original_query_text='{original_query_text}', query_text_for_llm='{query_text_for_llm}', metadata_filter={metadata_filter}, trigger_web_search={trigger_web_search}")
             
             if selected_category == 'direct_headlines':
                 retrieved_headlines_list = app_backend.get_headlines_from_filesystem(original_query_text, metadata_filter)
@@ -161,9 +164,9 @@ def handle_query():
                         {"role": "user", "content": executive_summary_prompt}
                     ]
 
-                    for chunk in llm_instance.stream(messages_for_llm):
-                        if chunk.content:
-                            response_queue.put({"type": "llm_chunk", "content": chunk.content})
+                    for chunk_content in llm_instance.stream(messages_for_llm):
+                        if chunk_content:
+                            response_queue.put({"type": "llm_chunk", "content": chunk_content})
                     
                     query_results["referenced_articles"] = retrieved_headlines_list
 
@@ -203,12 +206,9 @@ def handle_query():
                 query_results["citations"] = convert_docs_to_dicts(retrieved_docs_for_ui)
                 
             elif selected_category == 'auto':
-                content_kbs_for_auto_query = [
-                    kb for kb in knowledge_bases if kb not in [app_backend.NEWS_SUMMARIES_KB_NAME, app_backend.BLOG_SUMMARIES_KB_NAME, app_backend.SOCIAL_MEDIA_SUMMARIES_KB_NAME]
-                ]
                 llm_response_generator, retrieved_docs_for_ui = app_backend.handle_general_query(
                     llm_instance, knowledge_bases, original_query_text, 
-                    query_text_for_llm, content_kbs_for_auto_query, 
+                    query_text_for_llm, selected_category, 
                     app_backend.SYSTEM_INSTRUCTION_PROMPT,
                     retriever_settings
                 )
